@@ -21,6 +21,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,7 @@ from .mf import _sampler, contrast_map, matched_tracks
 from .tracks import DopplerTrack, find_tracks, whiten
 
 LOW_SR = 4000
+DUAL_MONO = 10 ** (-50 / 20)   # channels closer than this (rms, re the mix) are treated as one
 
 
 @dataclass
@@ -52,6 +54,7 @@ class ScrubConfig:
     mf_min_score: float | None = 2.0    # matched-filter floor (dB); the real threshold is set per recording
     mf_null_quantile: float = 0.9  # ... at this quantile of the time-reversed (up-sweep) null scores
     mf_max_score: float = 2.5      # ... but never above this: a blind search on Oyster Bay showed 2.5 suffices
+    mf_harmonics: int = 4          # also search the mean of harmonics 1..N (0 or 1: single lines only)
     seed: int = 0
     workers: int = field(default_factory=lambda: max(1, min(8, (os.cpu_count() or 2) // 2)))
     thresh_db: float = 6.0
@@ -75,14 +78,27 @@ def _smooth(p: np.ndarray, sr: int, length_s: float) -> np.ndarray:
 
 BB_RATE = 10        # Hz: everything after the heterodyne is ~1 Hz wide, so estimate at 10 Hz
 MID_RATE = 200      # Hz: intermediate rate where the +-4..6 Hz side bands are shifted
+BB_PASS = 3.0       # Hz: half-width kept flat in baseband (the widest band, lp_model_s, is ~+-2 Hz)
 
 
-def _decimate(z: np.ndarray, dec: int) -> np.ndarray:
-    """Boxcar-average blocks of `dec` samples (first null at sr/dec, far above the ~1 Hz band)."""
-    n = -(-len(z) // dec) * dec
-    zp = np.zeros(n, z.dtype)
-    zp[:len(z)] = z
-    return zp.reshape(-1, dec).mean(axis=1)
+@lru_cache(maxsize=None)
+def _fir(sr: float, dec: int, pass_hz: float, stop_hz: float) -> np.ndarray:
+    """Kaiser low-pass, flat to pass_hz and 90 dB down from stop_hz, with (len-1)/2 a
+    multiple of dec so that its delay is a whole number of output samples."""
+    n, beta = ss.kaiserord(90.0, (stop_hz - pass_hz) / (sr / 2))
+    half = -(-((n - 1) // 2 + 1) // dec) * dec
+    return ss.firwin(2 * half + 1, (pass_hz + stop_hz) / 2, window=("kaiser", beta), fs=sr)
+
+
+def _decimate(z: np.ndarray, sr: float, dec: int, pass_hz: float) -> np.ndarray:
+    """Keep every `dec`-th sample after a low-pass that is flat to pass_hz and rejects
+    everything that would alias to within pass_hz of 0; output sample i is at input sample
+    i*dec. A boxcar is not enough here: its -13 dB sidelobes let loud sound hundreds of hertz
+    away alias into the band being measured, inflating the side-band level and so the noise
+    put back (heard as a whistle where the band was quiet)."""
+    h = _fir(float(sr), dec, pass_hz, sr / dec - pass_hz)
+    k = (len(h) - 1) // 2 // dec
+    return ss.upfirdn(h, z, 1, dec)[k:k + -(-len(z) // dec)]
 
 
 def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
@@ -102,18 +118,17 @@ def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
     dec2 = int(round(mr / BB_RATE))
     br = mr / dec2                                  # baseband sample rate
     tt = np.arange(len(x)) / sr
-    tm = (np.arange(-(-len(x) // dec1)) + 0.5) * dec1 / sr
-    tb = (np.arange(-(-len(tm) // dec2)) + 0.5) * dec2 / mr
-    # the 1st boxcar barely touches +-6 Hz (sinc(6/200) ~ 0.9985); correct its gain anyway
-    gain = {o: np.sinc(o / mr) ** 2 for o in cfg.noise_offsets}
+    tm = np.arange(-(-len(x) // dec1)) * dec1 / sr
+    tb = np.arange(-(-len(tm) // dec2)) * dec2 / mr
+    mid_pass = max(abs(o) for o in cfg.noise_offsets) + BB_PASS   # the side bands, with their width
     finst = finst.copy()
     for it in range(3):
         phi = 2 * np.pi * np.cumsum(finst) / sr
-        e = np.exp(-1j * phi)
-        xm = _decimate(x * e, dec1)
-        a = 2 * _lowpass(_decimate(xm, dec2), br, lp_s)
-        side = np.sort([_smooth(np.abs(2 * _lowpass(_decimate(xm * np.exp(-2j * np.pi * o * tm), dec2),
-                                                    br, lp_s)) ** 2, br, 10.0) / gain[o]
+        e = _unit(-phi)
+        xm = _decimate(_times(x, e), sr, dec1, mid_pass)
+        a = 2 * _lowpass(_decimate(xm, mr, dec2, BB_PASS), br, lp_s)
+        side = np.sort([_smooth(np.abs(2 * _lowpass(_decimate(xm * np.exp(-2j * np.pi * o * tm), mr, dec2, BB_PASS),
+                                                    br, lp_s)) ** 2, br, 10.0)
                         for o in cfg.noise_offsets], axis=0)
         # trimmed mean of the side bands: robust to another tone in one of them, and unbiased
         # for noise (a plain median of skewed power estimates reads low)
@@ -132,21 +147,62 @@ def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
         ws = _smooth(w, br, 2.0)
         corr = np.clip(np.where(ws > 0.2, _smooth(dphi * w, br, 2.0) / np.maximum(ws, 1e-3), 0.0), -0.5, 0.5)
         finst += np.interp(tt, tb, corr)
-    # fade the replacement in and out over 5 s at the ends of the span
+    # never put back more than the band held: where the side bands read louder than the band
+    # itself (another sound in them), refilling at their level would add a tone-like band
+    pn = np.minimum(pn, _smooth(np.abs(a) ** 2, br, 10.0))
+    # fade the replacement in and out over 5 s at the ends of the span, and over 2 s where
+    # the line leaves fmin..fmax (a harmonic can sweep across fmax)
     n_r = max(1, min(int(5 * br), len(tb) // 2))
     g = np.ones(len(tb))
     g[:n_r] = g[-n_r:][::-1] = 0.5 - 0.5 * np.cos(np.pi * (np.arange(n_r) + 0.5) / n_r)
-    wn = (rng.standard_normal(len(tb)) + 1j * rng.standard_normal(len(tb))) / np.sqrt(2)
-    lw = _lowpass(wn, br, lp_s)
-    lw /= np.sqrt(np.mean(np.abs(lw) ** 2))
-    # measuring the fill (heterodyne, x2, low-pass) returns c*LP(lw): correct for that second low-pass
-    rho = np.mean(np.abs(_lowpass(lw, br, lp_s)) ** 2)
-    # subtract g*a (tone plus the band's own noise) and put back g*pn of fresh noise:
-    # the band then holds (1-g) of the original plus independent noise, at the floor's level
-    fill = np.sqrt(np.clip(1 - (1 - g) ** 2, 0, 1) * pn / rho) * lw
-    bb = g * a - fill
-    up = np.interp(tt, tb, bb.real) + 1j * np.interp(tt, tb, bb.imag)
-    return -np.real(up / e)
+    fb = np.interp(tb, tt, finst)
+    # (2*L - 1 of the smoothed in-range indicator: zero from the crossing on, not half-on there)
+    g *= np.clip(2 * _lowpass(((fb >= cfg.fmin) & (fb <= cfg.fmax)).astype(float), br, 2.0) - 1, 0, 1)
+    # the subtraction removes the band with the low-pass's response H; noise shaped by
+    # sqrt(1 - (1-H)^2) puts back exactly what it took, so the band's spectrum stays flat at
+    # the side-band density (a plain low-passed noise piles up at the centre: a bright core
+    # with dark flanks, a curve again under fine frequency resolution)
+    nt = len(tb)
+    kern = np.zeros(nt)
+    n_lp = max(3, int(lp_s * br) | 1)
+    w = np.hanning(n_lp + 2)[1:-1]
+    kern[np.arange(-(n_lp // 2), n_lp // 2 + 1) % nt] = w / w.sum()
+    H = np.clip(np.real(np.fft.fft(kern)), 0, 1)
+    wn = np.fft.ifft(np.fft.fft(rng.standard_normal(nt) + 1j * rng.standard_normal(nt)) *
+                     np.sqrt(1 - (1 - H) ** 2)) / np.sqrt(2)
+    # the side bands were measured through H: their power is the density times mean(H^2)
+    fill = np.sqrt(np.clip(1 - (1 - g) ** 2, 0, 1) * pn / np.mean(H ** 2)) * wn
+    d = -_carrier(g * a - fill, tt, tb, e)
+    # closed loop: measure the edited band the way it was estimated and scale it onto pn
+    # (2 s at a time). Whatever the estimate got wrong, a fill too loud (a whistle) or tone
+    # left over (a bright trace), the band ends up at its neighbours' level.
+    for _ in range(2):
+        ao = 2 * _lowpass(_decimate(_decimate(_times(x + d, e), sr, dec1, mid_pass), mr, dec2, BB_PASS), br, lp_s)
+        k = np.sqrt(np.clip(pn / np.maximum(_smooth(np.abs(ao) ** 2, br, 2.0), 1e-30), 0.25, 4.0))
+        d += _carrier(g * (k - 1) * ao, tt, tb, e)
+    return d
+
+
+def _carrier(bb: np.ndarray, tt: np.ndarray, tb: np.ndarray, e: np.ndarray) -> np.ndarray:
+    """Real signal at the line's frequency carrying the baseband amplitude bb (sampled at tb):
+    Re(bb / e), written out in real arithmetic (|e| = 1, so 1/e = conj(e))."""
+    return np.interp(tt, tb, bb.real) * e.real + np.interp(tt, tb, bb.imag) * e.imag
+
+
+def _unit(phi: np.ndarray) -> np.ndarray:
+    """exp(1j * phi), from cos and sin written straight into one array (3x faster than np.exp)."""
+    e = np.empty(len(phi), np.complex128)
+    np.cos(phi, out=e.real)
+    np.sin(phi, out=e.imag)
+    return e
+
+
+def _times(x: np.ndarray, e: np.ndarray) -> np.ndarray:
+    """x * e for real x and complex e, without promoting x to complex first."""
+    out = np.empty(len(x), np.complex128)
+    np.multiply(x, e.real, out=out.real)
+    np.multiply(x, e.imag, out=out.imag)
+    return out
 
 
 def _apply(x: np.ndarray, sr: int, tracks: list[DopplerTrack], cfg: ScrubConfig, stats: dict) -> np.ndarray:
@@ -217,9 +273,12 @@ def scan(x: np.ndarray, sr: int, cfg: ScrubConfig, log=None) -> list[DopplerTrac
         mt, thr = matched_tracks(whiten(L), t, f, f_lo=max(cfg.fmin, 40.0), f_hi=min(cfg.fmax, 450.0),
                                  min_score=cfg.mf_min_score, max_score=cfg.mf_max_score,
                                  null_quantile=cfg.mf_null_quantile,
+                                 searches=(1, cfg.mf_harmonics) if cfg.mf_harmonics > 1 else (1,),
                                  workers=cfg.workers)
         if log:
-            log(f"matched filter: threshold {thr:.2f} dB from the up-sweep null, {len(mt)} curves above it")
+            log("matched filter: thresholds " + ", ".join(f"{v:.2f} dB ({'1 line' if k == 1 else f'{k} harmonics'})"
+                                                          for k, v in thr.items())
+                + f" from the up-sweep null, {len(mt)} curves above them")
         tracks += [m for m in mt if not any(_same(m, k) for k in tracks)]
     return tracks
 
@@ -251,11 +310,11 @@ def _steady_part(x: np.ndarray, sr: int, freqs: np.ndarray) -> np.ndarray:
     dec = sr // BB_RATE
     br = sr / dec
     tt = np.arange(len(x)) / sr
-    tb = (np.arange(-(-len(x) // dec)) + 0.5) * dec / sr
+    tb = np.arange(-(-len(x) // dec)) * dec / sr
     out = np.zeros(len(x))
     for fs in freqs:
-        e = np.exp(-2j * np.pi * fs * tt)
-        a = 2 * _lowpass(_decimate(x * e, dec), br, 4.0)
+        e = _unit(-2 * np.pi * fs * tt)
+        a = 2 * _lowpass(_decimate(x * e, sr, dec, 1.0), br, 4.0)
         up = np.interp(tt, tb, a.real) + 1j * np.interp(tt, tb, a.imag)
         out += np.real(up / e)
     return out
@@ -285,11 +344,23 @@ def scrub_array(x: np.ndarray, sr: int = LOW_SR, cfg: ScrubConfig | None = None,
         if not new:
             break
         tracks += new
-        log(f"pass {passes_run}: {len(new)} new tracks ({sum(t.pts_t is None for t in new)} matched-filter); removing")
-        cur = cur + _apply(cur, sr, new, cfg, {})      # earlier tracks are already gone from cur
+        log(f"pass {passes_run}: {len(new)} new tracks ({sum(t.pts_t is None for t in new)} matched-filter)")
+        if passes_run < cfg.passes:                     # the cleaned mix only feeds the next pass
+            cur = cur + _apply(cur, sr, new, cfg, {})   # earlier tracks are already gone from cur
     stats: dict = {}
-    log(f"{len(tracks)} tracks; removing them from {len(x)} channel(s)")
-    delta = np.stack([_apply(ch, sr, tracks, cfg, stats) for ch in x])
+    # channels that are copies of each other (dual mono, up to codec noise) get one shared
+    # delta: half the work, and the edit stays mono instead of differing between the ears
+    same = len(x) > 1 and np.sqrt(np.mean((x - mono) ** 2)) <= DUAL_MONO * np.sqrt(np.mean(mono ** 2))
+    chans = [mono] if same else list(x)
+    log(f"{len(tracks)} tracks; removing them from {len(chans)} channel(s)"
+        + (f" (the {len(x)} channels are the same signal)" if same else ""))
+    # channels in parallel, each with its own pool of line workers
+    ch_stats = [{} for _ in chans]
+    with ThreadPoolExecutor(max_workers=len(chans)) as pool:
+        delta = np.stack(list(pool.map(lambda k: _apply(chans[k], sr, tracks, cfg, ch_stats[k]), range(len(chans)))))
+    stats["lines"] = sum(st.get("lines", 0) for st in ch_stats)
+    if same:
+        delta = np.repeat(delta, len(x), axis=0)
     sig = float(np.sqrt(np.mean(x ** 2)) + 1e-20)
     stats.update(passes=passes_run, tracks=len(tracks), steady_lines_hz=[round(float(v), 2) for v in steady],
                  delta_rms_db_re_signal=float(20 * np.log10(np.sqrt(np.mean(delta ** 2)) / sig + 1e-20)))
@@ -324,13 +395,16 @@ def _writer(src, out: Path, sr: int, ch: int, keep_video: bool):
     ext = out.suffix.lower()
     cmd = ["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(sr), "-ac", str(ch), "-i", "-"]
     if ext in _VIDEO and keep_video:
-        cmd += ["-i", str(src), "-map", "1:v?", "-map", "0:a", "-map_metadata", "1", "-c:v", "copy"] + _VIDEO[ext]
+        # picture only (V: no cover art), and none of the source's data streams (telemetry)
+        cmd += ["-i", str(src), "-map", "1:V?", "-map", "0:a", "-c:v", "copy"] + _VIDEO[ext]
     elif ext in _AUDIO_ONLY:
         cmd += _AUDIO_ONLY[ext]
     elif ext in _VIDEO:
         cmd += _VIDEO[ext]
     else:
         raise ValueError(f"unsupported output extension {ext!r}")
+    # no tags, chapters or encoder string: creation time, GPS and device place a recording too
+    cmd += ["-map_metadata", "-1", "-map_chapters", "-1", "-fflags", "+bitexact", "-flags:a", "+bitexact"]
     return subprocess.Popen(cmd + [str(out)], stdin=subprocess.PIPE)
 
 

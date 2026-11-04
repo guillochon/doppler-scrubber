@@ -38,17 +38,26 @@ time of closest approach, which is itself location-revealing: keep it private.
      (speed, distance, CPA time, frequency) grid is scored by its ridge
      contrast integrated over a 4-minute window, and the best are polished
      with Nelder-Mead. This finds tones far too faint to show frame by frame,
-     and anything scoring 2 dB or more is removed.
+     and anything scoring 2 dB or more is removed. The search is run again
+     on the mean contrast of harmonics 1–4: Doppler scales every harmonic by
+     the same factor, so a stack whose lines are each too faint alone can
+     stand out as a whole, and summing them is what an attacker would do.
 2. **Remove.** Each line (the track times every ratio m/h, h ≤ 2, up to
    `fmax`) is heterodyned to 0 Hz with its tracked phase and low-passed to get
    the tone's complex amplitude, with small frequency errors corrected from
    the phase drift. Over the track's span the band is *replaced*: the
    amplitude is subtracted in full and independent noise at the level of side
-   bands 4–6 Hz away is put back, so the band holds noise of the right level
-   and no tone at all, whatever its SNR. The band is about 1 Hz wide for a
-   measured ridge and about 2.5 Hz for a matched-filter model. Harmonic lines
-   other than the detected one are replaced only if, over the whole span,
-   they hold clearly more power than their side bands.
+   bands 4–6 Hz away is put back, shaped so the band's spectrum stays flat.
+   The band then holds noise of the right level and no tone at all, whatever
+   its SNR. It is about 1 Hz wide for a measured ridge and about 2.5 Hz for a
+   matched-filter model. Harmonic lines other than the detected one are
+   replaced only if, over the whole span, they hold clearly more power than
+   their side bands. The edited band is then measured again and scaled, 2 s
+   at a time, onto its target level (closed loop): tone left over is turned
+   down, and a fill estimated too loud cannot stand out. The target never
+   exceeds the band's own level, and a line is faded out where it sweeps
+   outside `fmin`–`fmax`: a band only 1–2 Hz wide that comes out louder than
+   the original is heard as a whistle.
 3. **Repeat** detection on the cleaned audio (2 passes) to catch tones that
    were hidden under stronger ones.
 4. **Protect steady lines.** Mains hum and machinery (bins loud at their 20th
@@ -56,11 +65,20 @@ time of closest approach, which is itself location-revealing: keep it private.
    flyover crossing them leaves them as they were.
 5. **Write.** The change is computed at 4 kHz, upsampled and added to the
    original full-rate samples, so content above ~1.9 kHz is untouched;
-   nothing more than ~1.3 Hz from a removed line changes.
+   nothing more than ~1.3 Hz from a removed line changes. All metadata
+   (creation time, GPS, device tags, chapters), data streams such as camera
+   telemetry, and cover art are dropped; the video stream is copied as is.
+   Metadata inside the video bitstream itself (such as the SEI timecode or
+   GPS some drones write) is not removed.
 
 The matched-filter threshold is set per recording from a null: the same
 search on the time-reversed spectrogram, where a real pass would sweep *up*,
 which no aircraft does. It is kept within 2.0–2.5 dB.
+
+The harmonic search, the closed-loop level check and the metadata
+stripping follow [doppstop](https://github.com/EvanBoyar/doppstop), which
+takes a broader approach to the same problem (also mains hum, decoys and
+background resynthesis).
 
 ## Results
 
@@ -71,14 +89,14 @@ attacker would have).
 | | Oyster Bay, NY (1 h) | SW Florida eagle cam (23 min clip) |
 |---|---|---|
 | dopplertrack `detect`, before | flyovers ranked 1 and 2 (15.7, 10.0) | flyovers ranked 1 and 3 (4.9, 3.7) |
-| dopplertrack `detect`, after | gone; best curve anywhere 2.9 | gone; best curve anywhere 1.7 |
+| dopplertrack `detect`, after | gone; best curve anywhere 1.9 | gone; best curve anywhere 2.2 |
 | known-point score of the true flight pair, before | 28.0 (the only pair) | 9.5, best wrong pair 6.7 |
-| known-point score of the true flight pair, after | 5.6 | 5.2, best wrong pair 6.6 |
+| known-point score of the true flight pair, after | 6.3 | 5.1, best wrong pair 5.8 (6.1 from the second camera point) |
 | blind 200 m search, before (dopplertrack README) | true pair 1st of 328, 43 m off after refining | true pair 1st of 607 |
-| blind 200 m search, after | true pair 59th of 328, top guess 31 km away | not run |
-| tracks removed / time | 330 / 12.4 min | 85 / 3.2 min |
-| change above 2 kHz | −40 dB re signal | −62 dB re signal |
-| STFT cells changed by > 1 dB | 25 % | 5.8 % |
+| blind 200 m search, after | not rerun for this version (0.1.0, where the true pair scored 7.9: 59th of 328, top guess 31 km away) | not run |
+| tracks removed / time | 408 / 14.6 min | 98 / 4.7 min |
+| change above 2 kHz | −55 dB re signal | −89 dB re signal |
+| STFT cells changed by > 1 dB | 26 % | 6.3 % |
 
 The cost depends on how busy the recording is. Oyster Bay, under New York
 approach paths, is full of Doppler-shaped tones, and the scrubber replaces a
@@ -105,8 +123,12 @@ recording and the second is the nest's published position.
   for. Turning aircraft are tracked by the ridge follower but fit worse.
 - The threshold is tuned against dopplertrack's detector. A better detector
   could find fainter curves than this one removes.
-- Speed: roughly 12 minutes per hour of stereo audio on a busy recording,
-  3 minutes per 20 minutes on a quiet one.
+- Where lines of two tracks run within ~6 Hz of each other, a strong tone can
+  leak into the other line's level estimate, and that narrow band can come
+  out up to ~10 dB louder (over 30 s) than it was.
+- Speed: roughly 15 minutes per hour of audio on a busy recording (Oyster
+  Bay, dual mono) and 5 minutes per 20 minutes on a quiet stereo one, on
+  16 threads.
 
 ## Development
 

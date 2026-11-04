@@ -7,6 +7,11 @@ the same kind of search. For each window, every (v, d, t_cpa) on a grid
 and every rest frequency is scored by the ridge contrast along the curve
 (on-curve brightness minus the two side bands at +-4 %), weighted towards
 the sweeping part; the best curves are then polished with Nelder-Mead.
+
+The search runs twice: on single lines, and on the mean contrast of the
+first few harmonics. Doppler scales every harmonic by the same factor, so
+summing them is where an attacker gains most: a stack whose lines are each
+too faint to clear the single-line threshold can stand out as a whole.
 """
 from __future__ import annotations
 
@@ -23,16 +28,19 @@ SWEEP_FLOOR = 0.15
 
 
 def _sampler(W, t, f):
+    """at(tq, fq): W at the nearest (frame, bin), 0 off the grid or where fq is not finite."""
     dt, df = t[1] - t[0], f[1] - f[0]
     F, T = W.shape
+    # one zero row and column past the end: every miss reads 0 through a single flat take
+    Wp = np.zeros((F + 1, T + 1), np.float32)
+    Wp[:F, :T] = W
+    flat = Wp.ravel()
 
     def at(tq, fq):
-        ti = np.rint((tq - t[0]) / dt).astype(np.int64)
-        fi = np.rint((fq - f[0]) / df).astype(np.int64)
-        ok = (ti >= 0) & (ti < T) & (fi >= 0) & (fi < F) & np.isfinite(fq)
-        out = np.zeros(np.broadcast(ti, fi).shape, np.float32)
-        out[ok] = W[fi[ok], ti[ok]]
-        return out
+        ti, fi = np.broadcast_arrays(np.rint((tq - t[0]) / dt), np.rint((fq - f[0]) / df))
+        ti = np.where((ti >= 0) & (ti < T), ti, T).astype(np.int64)
+        fi = np.where((fi >= 0) & (fi < F), fi, F).astype(np.int64)
+        return flat.take(fi * (T + 1) + ti)
     return at
 
 
@@ -57,13 +65,24 @@ def contrast_map(W, f):
     return C[idx]
 
 
-def _window(Cfat, t, f, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_curve, c, keep=8):
+def harmonic_map(C, f, harmonics):
+    """Mean of C over the harmonics h*f, h = 1..harmonics, for each fundamental bin f
+    (harmonics beyond the grid count as zero evidence)."""
+    df = f[1] - f[0]
+    out = np.zeros_like(C)
+    for h in range(1, harmonics + 1):
+        j = np.rint((h * f - f[0]) / df).astype(int)
+        ok = j < len(f)
+        out[ok] += C[j[ok]]
+    return out / harmonics
+
+
+def _window(at, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_curve, c, keep=8):
     """Top `keep` distinct grid curves in one window, as [(score, (f0, v, d, t_cpa))].
 
     Several are kept because on a coarse grid the maximum over thousands of noise curves
     can outscore a faint real curve; polishing then separates them (a real curve gains,
-    a noise curve loses)."""
-    at = _sampler(Cfat, t, f)
+    a noise curve loses). `at` samples the (widened) contrast map."""
     tq = np.linspace(ta, tb, n_curve)
     t0s = np.arange(ta, tb, t0_step)
     f0s = np.arange(f_lo, f_hi, f0_step)
@@ -89,8 +108,7 @@ def _window(Cfat, t, f, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_
     return out
 
 
-def _polish(W, t, f, p, ta, tb, c):
-    at = _sampler(W, t, f)
+def _polish(at, p, ta, tb, c, harmonics=1):
     tq = np.linspace(ta, tb, 400)
 
     def neg(q):
@@ -99,7 +117,8 @@ def _polish(W, t, f, p, ta, tb, c):
             return 1e3
         R = doppler_ratio(tq, v, d, tc, c)
         w = _weights(R, tq)
-        return -float(np.sum(w * _contrast(at, tq, f0 * R)) / np.sum(w))
+        con = sum(_contrast(at, tq, h * f0 * R) for h in range(1, harmonics + 1)) / harmonics
+        return -float(np.sum(w * con) / np.sum(w))
 
     f0, v, d, tc = p
     r = minimize(neg, p, method="Nelder-Mead",
@@ -111,7 +130,7 @@ def _polish(W, t, f, p, ta, tb, c):
 
 def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120.0,
                    min_score=2.0, max_score=4.0, null_quantile=0.9, min_sep_s=60.0, workers=4,
-                   c=C_SOUND) -> tuple[list[DopplerTrack], float]:
+                   searches=(1, 4), c=C_SOUND) -> tuple[list[DopplerTrack], dict]:
     """Doppler curves whose polished matched-filter score clears this recording's own null.
 
     W is a whitened spectrogram (F, T). Returns (tracks, threshold): the threshold is the
@@ -120,39 +139,56 @@ def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120
     with strong steady tones a reversed curve resting on one scores high, and an uncapped
     null would then spare real flyovers. Returned tracks have no measured
     ridge (pts_t is None): their curve is the fitted model.
+
+    `searches` lists the harmonic counts searched: 1 is single lines, n > 1 the mean
+    contrast of harmonics 1..n, for fundamentals up to f[-1]/n, each with its own null;
+    its bounds are scaled by n**-0.4: averaging shrinks the noise spread by about 1/sqrt(n),
+    but the best of many noise curves then sits relatively higher (in pure noise the
+    4-harmonic search peaks at ~0.95 dB, the single-line one at ~2.1 dB).
+    Returns (tracks, {harmonics searched: threshold}).
     """
     v_grid = np.arange(40, 175, 15.0)
     d_grid = np.geomspace(300, 12000, 10)
     starts = np.arange(t[0], max(t[-1] - window_s, t[0]) + 1e-9, step_s)
 
-    def search(Wd):
+    def search(Wd, nh, lo_score, hi_f):
         # a grid curve 1-2 Hz off a ridge still scores on the widened map
         Cd = contrast_map(maximum_filter1d(Wd, 5, axis=0), f)
+        if nh > 1:
+            Cd = harmonic_map(Cd, f, nh)
+        at_c, at_w = _sampler(Cd, t, f), _sampler(Wd, t, f)
 
         def job(ta):
             tb = min(ta + window_s, t[-1])
-            return _window(Cd, t, f, ta, tb, f_lo, f_hi, v_grid, d_grid, 2.0, 3.0, 64, c)
+            return _window(at_c, ta, tb, f_lo, hi_f, v_grid, d_grid, 2.0, 3.0, 64, c)
 
         def polish(p):
             tc_heard = p[3] + p[2] / c
             lo, hi = max(tc_heard - 120, t[0]), min(tc_heard + 120, t[-1])
-            return _polish(Wd, t, f, p, lo, hi, c) + (lo, hi)
+            return _polish(at_w, p, lo, hi, c, nh) + (lo, hi)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            cands = [p for win in pool.map(job, starts) for sc, p in win if sc >= 0.6 * min_score]
+            cands = [p for win in pool.map(job, starts) for sc, p in win if sc >= 0.6 * lo_score]
             return list(pool.map(polish, cands))
 
-    polished = search(W)
-    # null: the same search on the time-reversed spectrogram, where a real pass would sweep
-    # *up*, which no aircraft does; its scores are what this recording's clutter reaches
-    null = [sc for sc, *_ in search(np.ascontiguousarray(W[:, ::-1]))]
-    thr = float(np.clip(np.quantile(null, null_quantile), min_score, max_score)) if null else min_score
-    out = []
-    for sc, q, lo, hi in sorted(polished, key=lambda x: -x[0]):
-        if sc < thr:
+    found, thrs = [], {}
+    for nh in searches:
+        scale = nh ** -0.4
+        hi_f = min(f_hi, f[-1] / nh)
+        if hi_f <= f_lo:
             continue
+        polished = search(W, nh, min_score * scale, hi_f)
+        # null: the same search on the time-reversed spectrogram, where a real pass would sweep
+        # *up*, which no aircraft does; its scores are what this recording's clutter reaches
+        null = [sc for sc, *_ in search(np.ascontiguousarray(W[:, ::-1]), nh, min_score * scale, hi_f)]
+        thr = float(np.clip(np.quantile(null, null_quantile), min_score * scale, max_score * scale))             if null else min_score * scale
+        thrs[nh] = thr
+        # scores compared across the two searches in units of their own threshold
+        found += [(sc / thr, sc, q, lo, hi) for sc, q, lo, hi in polished if sc >= thr]
+    out = []
+    for _, sc, q, lo, hi in sorted(found, key=lambda x: -x[0]):
         f0, v, d, tc = map(float, q)
         if any(abs((tc + d / c) - (k.t_cpa + k.d / c)) < min_sep_s and abs(f0 - k.f0) < 0.05 * f0 for k in out):
             continue
         R = doppler_ratio(np.array([lo, hi]), v, d, tc, c)
         out.append(DopplerTrack(lo, hi, f0, v, d, tc, rms=1.0, sweep=float(f0 * (R[0] - R[1])), snr_db=sc))
-    return sorted(out, key=lambda k: k.t0), thr
+    return sorted(out, key=lambda k: k.t0), thrs

@@ -1,4 +1,6 @@
 import numpy as np
+import scipy.ndimage as nd
+import scipy.signal as ss
 
 from doppler_scrubber import ScrubConfig, scrub_array, stft
 from doppler_scrubber.tracks import ideal_curve
@@ -84,3 +86,32 @@ def test_noise_only_is_left_alone():
     delta, tracks, _ = scrub_array(x[None, :], SR, ScrubConfig())
     assert tracks == []
     assert not np.any(delta)
+
+
+def test_no_whistle_above_fmax():
+    # a pass whose harmonics sweep across fmax, over a background that is loud at low
+    # frequencies and quiet above (as outdoors): nothing above fmax may change, and no band
+    # may come out louder than it was (a 1-2 Hz band of extra noise is heard as a whistle)
+    rng = np.random.default_rng(4)
+    t = np.arange(0, 300, 1 / SR)
+    low = ss.sosfilt(ss.butter(4, 300, fs=SR, output="sos"), rng.standard_normal(len(t)))
+    x = 0.5 * low + 0.003 * rng.standard_normal(len(t))
+    x += sum(_tone(t, 150.0 * h, 90.0, 800.0, 150.0, 0.03 / h) for h in range(1, 9))
+    cfg = ScrubConfig(fmax=1000.0)
+    delta, tracks, _ = scrub_array(x[None, :], SR, cfg)
+    assert len(tracks) >= 1
+    d = delta[0]
+    fd = np.fft.rfftfreq(len(d), 1 / SR)
+    P, Pd = np.abs(np.fft.rfft(x)) ** 2, np.abs(np.fft.rfft(d)) ** 2
+    above = fd > cfg.fmax + 20
+    assert Pd[above].sum() < 1e-4 * P[above].sum()
+    # 30 s-smoothed power per ~0.5 Hz bin, output vs input: a whistle is a band that stays
+    # louder (the old code: +16 dB above fmax, 99.9th percentile +4.9 dB); a noise-for-noise
+    # swap only fluctuates (over 5 s it passes +6 dB in a few % of the cells it replaces)
+    _, f, L0 = stft.power_db(x, SR, 8192, 1000, 30, 2000)
+    _, _, L1 = stft.power_db(x + d, SR, 8192, 1000, 30, 2000)
+    p0 = nd.uniform_filter1d(10 ** (L0 / 10), 120, axis=1)
+    p1 = nd.uniform_filter1d(10 ** (L1 / 10), 120, axis=1)
+    r = 10 * np.log10(p1 / p0)
+    assert r[f > cfg.fmax + 20].max() < 1.0
+    assert np.percentile(r, 99.9) < 3.5
