@@ -1,0 +1,34 @@
+[project]
+name = "doppler-scrubber"
+version = "0.1.0"
+description = "Remove aircraft Doppler tones from audio and video so recordings cannot be geolocated from them"
+readme = "README.md"
+authors = [
+    { name = "James Guillochon", email = "guillochon@gmail.com" }
+]
+license = "MIT"
+requires-python = ">=3.12"
+keywords = ["doppler", "privacy", "audio", "geolocation", "osint", "spectrogram"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Security",
+]
+
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.13",
+]
+
+[project.scripts]
+doppler-scrubber = "doppler_scrubber.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.3,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
