@@ -29,7 +29,7 @@ import scipy.ndimage as nd
 import scipy.signal as ss
 from numba import njit
 
-from . import stft
+from . import gpu, stft
 from .mf import _sampler, contrast_map, matched_tracks
 from .tracks import DopplerTrack, find_tracks, whiten
 
@@ -59,6 +59,7 @@ class ScrubConfig:
     mf_harmonics: int = 4          # also search the mean of harmonics 1..N (0 or 1: single lines only)
     seed: int = 0
     workers: int = field(default_factory=lambda: max(1, min(8, (os.cpu_count() or 2) // 2)))
+    device: str = "auto"           # removal on "gpu" (CUDA, via the `gpu` extra), "cpu", or "auto": the GPU if one works
     processes: bool = False        # fit ridge tracks in a pool of `workers` processes (about 3x faster
                                    # detection; the CLI turns it on). A script that sets it must call
                                    # the scrubber under `if __name__ == "__main__":` (workers re-import it)
@@ -295,7 +296,8 @@ def _edit(y: np.ndarray, sr: int, tracks: list[DopplerTrack], cfg: ScrubConfig, 
         tg, fg = tg[ok], fg[ok]
         a, b = int(tg[0] * sr), min(len(x), int(tg[-1] * sr) + 1)
         fs = np.interp(np.arange(a, b) / sr, tg, fg)
-        ratios = [r for r in _ratios(cfg) if not (fs.max() * r < cfg.fmin or fs.min() * r > cfg.fmax)]
+        fs_lo, fs_hi = float(fs.min()), float(fs.max())
+        ratios = [r for r in _ratios(cfg) if not (fs_hi * r < cfg.fmin or fs_lo * r > cfg.fmax)]
         tq = ts[(ts >= a / sr) & (ts <= b / sr)]
         fq = np.interp(tq, tg, fg)
 
@@ -307,6 +309,15 @@ def _edit(y: np.ndarray, sr: int, tracks: list[DopplerTrack], cfg: ScrubConfig, 
         # a measured ridge is accurate to a fraction of a hertz; a matched-filter model
         # (no ridge) only to a hertz or so, so it gets a wider band
         lp = cfg.lp_s if tr.pts_t is not None else cfg.lp_model_s
+        if gpu.use(cfg.device):
+            # all of the track's lines at once on the GPU, the same noise streams as below
+            if keep:
+                y[a:b] += gpu.remove_lines(y[a:b].copy(), fs, [ratios[k] for k in keep],
+                                           [ratios[k] == 1.0 for k in keep],
+                                           [np.random.default_rng([cfg.seed, ti, k]) for k in keep],
+                                           sr, cfg, lp, _fir, (MID_RATE, BB_RATE, BB_PASS))
+            lines += len(keep)
+            continue
         seg = y[a:b].copy()
 
         def one(k):
@@ -334,7 +345,7 @@ def scan(x: np.ndarray, sr: int, cfg: ScrubConfig, log=None) -> list[DopplerTrac
                                  min_score=cfg.mf_min_score, max_score=cfg.mf_max_score,
                                  null_quantile=cfg.mf_null_quantile,
                                  searches=(1, cfg.mf_harmonics) if cfg.mf_harmonics > 1 else (1,),
-                                 workers=cfg.workers)
+                                 workers=cfg.workers, device=cfg.device)
         if log:
             log("matched filter: thresholds " + ", ".join(f"{v:.2f} dB ({'1 line' if k == 1 else f'{k} harmonics'})"
                                                           for k, v in thr.items())
@@ -391,6 +402,7 @@ def scrub_array(x: np.ndarray, sr: int = LOW_SR, cfg: ScrubConfig | None = None,
     log = log or (lambda m: None)
     x = np.atleast_2d(np.asarray(x, np.float64))
     steady = steady_lines(x.mean(axis=0), sr, cfg)
+    log("removal on " + (f"the GPU ({gpu.available()})" if gpu.use(cfg.device) else "the CPU"))
     log(f"steady lines protected: {[round(float(v), 1) for v in steady]}")
     if len(steady):
         x = x - np.stack([_steady_part(ch, sr, steady) for ch in x])

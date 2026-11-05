@@ -115,3 +115,21 @@ def test_no_whistle_above_fmax():
     r = 10 * np.log10(p1 / p0)
     assert r[f > cfg.fmax + 20].max() < 1.0
     assert np.percentile(r, 99.9) < 3.5
+
+
+def test_gpu_removal_matches_cpu():
+    import pytest
+    from doppler_scrubber import gpu
+    from doppler_scrubber.scrub import _apply, scan
+    if gpu.available() is None:
+        pytest.skip("no usable CUDA device")
+    rng = np.random.default_rng(3)
+    t = np.arange(0, 300, 1 / SR)
+    x = 0.3 * rng.standard_normal(len(t)) + _tone(t, 140.0, 70.0, 1500.0, 150.0, 0.03) \
+        + _tone(t, 280.0, 70.0, 1500.0, 150.0, 0.015)
+    tracks = scan(x, SR, ScrubConfig(device="cpu"))
+    assert tracks
+    d_cpu = _apply(x, SR, tracks, ScrubConfig(device="cpu"), {})
+    d_gpu = _apply(x, SR, tracks, ScrubConfig(device="gpu"), {})
+    # the same edit up to rounding (the noise is drawn from the same seeded streams)
+    assert np.sum((d_gpu - d_cpu) ** 2) < 1e-10 * np.sum(d_cpu ** 2)

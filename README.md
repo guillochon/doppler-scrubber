@@ -25,6 +25,21 @@ uv run doppler-scrubber scrub recording.wav clean.flac --report report.json
 The report lists the removed tracks with their fitted speed, distance and
 time of closest approach, which is itself location-revealing: keep it private.
 
+### GPU
+
+With an NVIDIA GPU, install the optional CUDA backend (CuPy with its own CUDA 12
+libraries; any recent driver works, no CUDA toolkit needed):
+
+```bash
+uv sync --extra gpu        # or: pip install "doppler-scrubber[gpu]"
+```
+
+The GPU is then used automatically when one is found (`--device auto`, the
+default); `--device cpu` or `--device gpu` forces either. The removal and the
+matched filter's grid search run there, giving the same result as the CPU up to
+rounding; the ridge tracking and curve fitting stay on the CPU. The first run
+compiles the CUDA kernels (about half a minute) and caches them.
+
 From Python, `scrub_file(src, out, ScrubConfig(processes=True))` uses the same
 process pool as the CLI for the ridge fits; Windows and macOS start its workers
 by re-importing your script, so call it under `if __name__ == "__main__":`.
@@ -101,7 +116,7 @@ attacker would have).
 | known-point score of the true flight pair, after (3 noise seeds) | 6.1–7.8 | 5.8–6.0, best wrong pair 4.8–5.1 |
 | blind 200 m search, before (dopplertrack README) | true pair 1st of 328, 43 m off after refining | true pair 1st of 607 |
 | blind 200 m search, after | not rerun for this version (0.1.0, where the true pair scored 7.9: 59th of 328, top guess 31 km away) | not run |
-| tracks removed / time | 454 / 8.3 min | 117 / 4.6 min |
+| tracks removed / time (CPU; with GPU) | 454 / 8.3 min; 4.6 min | 117 / 4.6 min; 1.6 min |
 | change above 2 kHz | −54 dB re signal | −81 dB re signal |
 | STFT cells changed by > 1 dB | 35 % | 9.3 % |
 
@@ -144,7 +159,9 @@ recording and the second is the nest's published position.
 - A suspected location can still be weakly confirmed (see Results).
 - Speed: about 8 minutes per hour of audio on a busy recording (Oyster Bay,
   dual mono) and 5 minutes for 23 minutes of a quieter stereo one (eagle
-  cam), at below-normal priority on a 10-core Intel i5-12600K. The search
+  cam), at below-normal priority on a 10-core Intel i5-12600K; with an RTX
+  3080, 4.6 and 1.6 minutes. Ridge tracking and curve fitting, on the CPU,
+  are then most of the time. The search
   kernels are compiled with Numba (the first run compiles and caches them).
 
 ## Development

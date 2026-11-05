@@ -20,6 +20,8 @@ def main(argv=None):
     s.add_argument("--passes", type=int, default=2); s.add_argument("--fmax", type=float, default=S.ScrubConfig.fmax)
     s.add_argument("--extend", type=float, default=90.0, help="seconds to clean beyond each visible track")
     s.add_argument("--thresh", type=float, default=6.0, help="peak threshold, dB above per-bin median")
+    s.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto",
+                   help="where to run the removal: a CUDA GPU if one is usable (auto, the default), or force one")
 
     c = sub.add_parser("scan", help="list Doppler tracks without writing anything")
     c.add_argument("input"); c.add_argument("--fmax", type=float, default=S.ScrubConfig.fmax)
@@ -27,7 +29,8 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     if a.cmd == "scrub":
-        cfg = S.ScrubConfig(passes=a.passes, fmax=a.fmax, extend_s=a.extend, thresh_db=a.thresh, processes=True)
+        cfg = S.ScrubConfig(passes=a.passes, fmax=a.fmax, extend_s=a.extend, thresh_db=a.thresh, processes=True,
+                            device=a.device)
         t0 = time.time()
         def log(m):
             print(f"[{time.time() - t0:6.0f} s] {m}", file=sys.stderr, flush=True)

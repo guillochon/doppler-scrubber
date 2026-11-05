@@ -22,6 +22,7 @@ from scipy.ndimage import maximum_filter1d
 from numba import njit
 from scipy.optimize import minimize
 
+from . import gpu
 from .tracks import C_SOUND, DopplerTrack, doppler_ratio
 
 CONTRAST = 0.04
@@ -93,7 +94,7 @@ def _grid_scores(C, ti, R, w, f0s, f_first, df):
     return out
 
 
-def _window(C, t, f, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_curve, c, keep=8):
+def _window(C, t, f, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_curve, c, keep=8, Cg=None):
     """Top `keep` distinct grid curves in one window, as [(score, (f0, v, d, t_cpa))].
 
     Several are kept because on a coarse grid the maximum over thousands of noise curves
@@ -104,15 +105,21 @@ def _window(C, t, f, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_cur
     f0s = np.arange(f_lo, f_hi, f0_step)
     ti = np.rint((tq - t[0]) / (t[1] - t[0])).astype(np.int64)
     cand = []
-    for v in v_grid:
-        for d in d_grid:
-            R = doppler_ratio(tq[None, :], v, d, t0s[:, None], c)          # (T0, N)
-            w = _weights(R, tq)
-            w /= w.sum(axis=1, keepdims=True)
-            s = _grid_scores(C, ti, R, w, f0s, float(f[0]), float(f[1] - f[0]))
-            for k in np.argsort(s, axis=None)[-keep:]:
-                i, j = np.unravel_index(int(k), s.shape)
-                cand.append((float(s[i, j]), (float(f0s[j]), float(v), float(d), float(t0s[i]))))
+    vd = [(v, d) for v in v_grid for d in d_grid]
+    Rs, Ws = [], []
+    for v, d in vd:
+        R = doppler_ratio(tq[None, :], v, d, t0s[:, None], c)          # (T0, N)
+        w = _weights(R, tq)
+        w /= w.sum(axis=1, keepdims=True)
+        Rs.append(R)
+        Ws.append(w)
+    if Cg is not None:          # every (v, d) at once on the GPU
+        S = gpu.grid_scores(Cg, ti, np.stack(Rs), np.stack(Ws), f0s, float(f[0]), float(f[1] - f[0]))
+    for q, (v, d) in enumerate(vd):
+        s = S[q] if Cg is not None else _grid_scores(C, ti, Rs[q], Ws[q], f0s, float(f[0]), float(f[1] - f[0]))
+        for k in np.argsort(s, axis=None)[-keep:]:
+            i, j = np.unravel_index(int(k), s.shape)
+            cand.append((float(s[i, j]), (float(f0s[j]), float(v), float(d), float(t0s[i]))))
     cand.sort(key=lambda x: -x[0])
     out = []
     for sc, p in cand:     # distinct: another CPA time, or another frequency
@@ -181,7 +188,7 @@ def _polish(Wd, t, f, p, ta, tb, c, harmonics=1):
 
 def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120.0,
                    min_score=2.0, max_score=4.0, null_quantile=0.9, min_sep_s=60.0, workers=4,
-                   searches=(1, 4), harm_f_max=1000.0, c=C_SOUND) -> tuple[list[DopplerTrack], dict]:
+                   searches=(1, 4), harm_f_max=1000.0, device="cpu", c=C_SOUND) -> tuple[list[DopplerTrack], dict]:
     """Doppler curves whose polished matched-filter score clears this recording's own null.
 
     W is a whitened spectrogram (F, T). Returns (tracks, threshold): the threshold is the
@@ -196,8 +203,9 @@ def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120
     its bounds are scaled by n**-0.4: averaging shrinks the noise spread by about 1/sqrt(n),
     but the best of many noise curves then sits relatively higher (in pure noise the
     4-harmonic search peaks at ~0.95 dB, the single-line one at ~2.1 dB).
-    Returns (tracks, {harmonics searched: threshold}).
+    Returns (tracks, {harmonics searched: threshold}). `device` is as ScrubConfig.device.
     """
+    on_gpu = gpu.use(device)       # the grid scoring on the GPU (same result); polishing stays on the CPU
     v_grid = np.arange(40, 175, 15.0)
     d_grid = np.geomspace(300, 12000, 10)
     starts = np.arange(t[0], max(t[-1] - window_s, t[0]) + 1e-9, step_s)
@@ -208,11 +216,12 @@ def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120
         if nh > 1:
             Cd = harmonic_map(Cd, f, nh)
         Cd = np.ascontiguousarray(Cd, np.float32)
+        Cg = gpu.to_device(Cd) if on_gpu else None
         W32 = np.ascontiguousarray(Wd, np.float32)
 
         def job(ta):
             tb = min(ta + window_s, t[-1])
-            return _window(Cd, t, f, ta, tb, f_lo, hi_f, v_grid, d_grid, 2.0, 3.0, 64, c)
+            return _window(Cd, t, f, ta, tb, f_lo, hi_f, v_grid, d_grid, 2.0, 3.0, 64, c, Cg=Cg)
 
         def polish(p):
             tc_heard = p[3] + p[2] / c
