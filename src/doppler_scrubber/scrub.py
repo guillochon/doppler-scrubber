@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import scipy.ndimage as nd
 import scipy.signal as ss
+from numba import njit
 
 from . import stft
 from .mf import _sampler, contrast_map, matched_tracks
@@ -58,6 +59,9 @@ class ScrubConfig:
     mf_harmonics: int = 4          # also search the mean of harmonics 1..N (0 or 1: single lines only)
     seed: int = 0
     workers: int = field(default_factory=lambda: max(1, min(8, (os.cpu_count() or 2) // 2)))
+    processes: bool = False        # fit ridge tracks in a pool of `workers` processes (about 3x faster
+                                   # detection; the CLI turns it on). A script that sets it must call
+                                   # the scrubber under `if __name__ == "__main__":` (workers re-import it)
     thresh_db: float = 6.0
     max_rms: float = 0.3
     min_dur_s: float = 12.0
@@ -112,25 +116,32 @@ def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
     detected on, which is always replaced; any other harmonic line is replaced only
     if, averaged over the whole span, it holds clearly more power than its side bands.
     """
-    # two-stage decimation: 4 kHz -> MID_RATE once per iteration (the only full-rate work),
-    # side-band offsets applied there, then -> BB_RATE for estimation
+    # two-stage decimation: 4 kHz -> MID_RATE once (the only full-rate work besides the final
+    # carrier), side-band offsets applied there, then -> BB_RATE for estimation. Everything
+    # after the first heterodyne is a slow phase or amplitude change of a band a few hertz
+    # wide, so it is applied at MID_RATE: the frequency corrections (under 0.5 Hz, smoothed
+    # over 2 s) as a phase ramp on the decimated band, the closed loop's re-measure from the
+    # baseband edit itself, and the full-rate carrier is built once at the end.
     dec1 = sr // MID_RATE
     mr = sr / dec1
     dec2 = int(round(mr / BB_RATE))
     br = mr / dec2                                  # baseband sample rate
-    tt = np.arange(len(x)) / sr
     tm = np.arange(-(-len(x) // dec1)) * dec1 / sr
     tb = np.arange(-(-len(tm) // dec2)) * dec2 / mr
     mid_pass = max(abs(o) for o in cfg.noise_offsets) + BB_PASS   # the side bands, with their width
-    finst = finst.copy()
+    e, xe = _mix_down(x, finst, float(sr))
+    xm0 = _decimate(xe, sr, dec1, mid_pass)
+    del xe
+    side_e = [np.exp(-2j * np.pi * o * tm) for o in cfg.noise_offsets]
+    cf = np.zeros(len(tb))                          # frequency correction so far, Hz (at tb)
+    psi = np.zeros(len(tm))                         # its phase (at tm)
     for it in range(3):
-        phi = 2 * np.pi * np.cumsum(finst) / sr
-        e = _unit(-phi)
-        xm = _decimate(_times(x, e), sr, dec1, mid_pass)
+        xm = xm0 if it == 0 else xm0 * _unit(-psi)
+        psi_used, cf_used = psi, cf.copy()
         a = 2 * _lowpass(_decimate(xm, mr, dec2, BB_PASS), br, lp_s)
-        side = np.sort([_smooth(np.abs(2 * _lowpass(_decimate(xm * np.exp(-2j * np.pi * o * tm), mr, dec2, BB_PASS),
+        side = np.sort([_smooth(np.abs(2 * _lowpass(_decimate(xm * s, mr, dec2, BB_PASS),
                                                     br, lp_s)) ** 2, br, 10.0)
-                        for o in cfg.noise_offsets], axis=0)
+                        for s in side_e], axis=0)
         # trimmed mean of the side bands: robust to another tone in one of them, and unbiased
         # for noise (a plain median of skewed power estimates reads low)
         pn = side[1:-1].mean(axis=0) if len(side) > 2 else side.mean(axis=0)
@@ -147,7 +158,10 @@ def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
         w = strong.astype(float)
         ws = _smooth(w, br, 2.0)
         corr = np.clip(np.where(ws > 0.2, _smooth(dphi * w, br, 2.0) / np.maximum(ws, 1e-3), 0.0), -0.5, 0.5)
-        finst += np.interp(tt, tb, corr)
+        cf += corr
+        # running phase of the corrected frequency, as the full-rate cumsum would give it at tm
+        cfm = np.interp(tm, tb, cf)
+        psi = 2 * np.pi * ((np.cumsum(cfm) - cfm) * dec1 + cfm) / sr
     # never put back more than the band held: where the side bands read louder than the band
     # itself (another sound in them), refilling at their level would add a tone-like band
     pn = np.minimum(pn, _smooth(np.abs(a) ** 2, br, 10.0))
@@ -156,7 +170,7 @@ def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
     n_r = max(1, min(int(5 * br), len(tb) // 2))
     g = np.ones(len(tb))
     g[:n_r] = g[-n_r:][::-1] = 0.5 - 0.5 * np.cos(np.pi * (np.arange(n_r) + 0.5) / n_r)
-    fb = np.interp(tb, tt, finst)
+    fb = finst[np.minimum(np.arange(len(tb)) * (dec1 * dec2), len(finst) - 1)] + cf_used
     # (2*L - 1 of the smoothed in-range indicator: zero from the crossing on, not half-on there)
     g *= np.clip(2 * _lowpass(((fb >= cfg.fmin) & (fb <= cfg.fmax)).astype(float), br, 2.0) - 1, 0, 1)
     # the subtraction removes the band with the low-pass's response H; noise shaped by
@@ -173,21 +187,58 @@ def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
                      np.sqrt(1 - (1 - H) ** 2)) / np.sqrt(2)
     # the side bands were measured through H: their power is the density times mean(H^2)
     fill = np.sqrt(np.clip(1 - (1 - g) ** 2, 0, 1) * pn / np.mean(H ** 2)) * wn
-    d = -_carrier(g * a - fill, tt, tb, e)
+    # the edit is d = -carrier(B); B is what gets subtracted from the band, in baseband
+    B = g * a - fill
     # closed loop: measure the edited band the way it was estimated and scale it onto pn
     # (2 s at a time). Whatever the estimate got wrong, a fill too loud (a whistle) or tone
-    # left over (a bright trace), the band ends up at its neighbours' level.
+    # left over (a bright trace), the band ends up at its neighbours' level. Heterodyned and
+    # decimated, x + d is the band a minus the edit B as the carrier's linear interpolation
+    # renders it (its 2f image is filtered out), so it is measured at MID_RATE.
     for _ in range(2):
-        ao = 2 * _lowpass(_decimate(_decimate(_times(x + d, e), sr, dec1, mid_pass), mr, dec2, BB_PASS), br, lp_s)
+        ao = a - _lowpass(_decimate(np.interp(tm, tb, B.real) + 1j * np.interp(tm, tb, B.imag),
+                                    mr, dec2, BB_PASS), br, lp_s)
         k = np.sqrt(np.clip(pn / np.maximum(_smooth(np.abs(ao) ** 2, br, 2.0), 1e-30), 0.25, 4.0))
-        d += _carrier(g * (k - 1) * ao, tt, tb, e)
-    return d
+        B = B - g * (k - 1) * ao
+    # back onto the corrected carrier: e * exp(-i psi) at full rate, the phase folded into B
+    psib = np.interp(tb, tm, psi_used)
+    Bc = B * _unit(psib)
+    return _carrier(np.ascontiguousarray(Bc.real), np.ascontiguousarray(Bc.imag), dec1 * dec2, e, -1.0)
 
 
-def _carrier(bb: np.ndarray, tt: np.ndarray, tb: np.ndarray, e: np.ndarray) -> np.ndarray:
-    """Real signal at the line's frequency carrying the baseband amplitude bb (sampled at tb):
-    Re(bb / e), written out in real arithmetic (|e| = 1, so 1/e = conj(e))."""
-    return np.interp(tt, tb, bb.real) * e.real + np.interp(tt, tb, bb.imag) * e.imag
+@njit(cache=True, nogil=True)
+def _mix_down(x, finst, sr):
+    """e = exp(-i 2 pi cumsum(finst) / sr) and x * e, in one pass over the samples."""
+    n = len(x)
+    e = np.empty(n, np.complex128)
+    xe = np.empty(n, np.complex128)
+    acc = 0.0
+    for i in range(n):
+        acc += finst[i]
+        ph = -2.0 * np.pi * acc / sr
+        c, s = np.cos(ph), np.sin(ph)
+        e[i] = complex(c, s)
+        xe[i] = complex(x[i] * c, x[i] * s)
+    return e, xe
+
+
+@njit(cache=True, nogil=True)
+def _carrier(bre, bim, step, e, scale):
+    """scale * Re(bb / e) at full rate, bb = bre + i bim sampled every `step` samples and
+    linearly interpolated (held after the last): the line's real signal (|e| = 1, so
+    1/e = conj(e))."""
+    n = len(e)
+    nb = len(bre)
+    out = np.empty(n)
+    for i in range(n):
+        k = i // step
+        if k >= nb - 1:
+            r, m = bre[nb - 1], bim[nb - 1]
+        else:
+            fr = (i - k * step) / step
+            r = bre[k] + fr * (bre[k + 1] - bre[k])
+            m = bim[k] + fr * (bim[k + 1] - bim[k])
+        out[i] = scale * (r * e[i].real + m * e[i].imag)
+    return out
 
 
 def _unit(phi: np.ndarray) -> np.ndarray:
@@ -196,14 +247,6 @@ def _unit(phi: np.ndarray) -> np.ndarray:
     np.cos(phi, out=e.real)
     np.sin(phi, out=e.imag)
     return e
-
-
-def _times(x: np.ndarray, e: np.ndarray) -> np.ndarray:
-    """x * e for real x and complex e, without promoting x to complex first."""
-    out = np.empty(len(x), np.complex128)
-    np.multiply(x, e.real, out=out.real)
-    np.multiply(x, e.imag, out=out.imag)
-    return out
 
 
 def _apply(x: np.ndarray, sr: int, tracks: list[DopplerTrack], cfg: ScrubConfig, stats: dict) -> np.ndarray:
@@ -215,15 +258,28 @@ def _apply(x: np.ndarray, sr: int, tracks: list[DopplerTrack], cfg: ScrubConfig,
     from the same input; numpy releases the GIL in the heavy array work.
     """
     y = x.astype(np.float64)
-    lines = 0
-    if not tracks:
-        return y - x
-    # the detection spectrogram's ridge-contrast map, used to skip empty harmonic lines
-    # before any full-rate work (most of a track's lines carry nothing)
+    if tracks:
+        _edit(y, sr, tracks, cfg, stats, _line_map(x, sr, cfg))
+    return y - x
+
+
+def _line_map(x: np.ndarray, sr: int, cfg: ScrubConfig):
+    """The detection spectrogram's ridge-contrast map of x, used to skip empty harmonic
+    lines before any full-rate work (most of a track's lines carry nothing)."""
     ts, fsp, L = stft.power_db(x, sr, cfg.n_detect, cfg.hop_detect, cfg.fmin, cfg.fmax)
-    cmap = _sampler(contrast_map(whiten(L), fsp), ts, fsp)
+    return _sampler(contrast_map(whiten(L), fsp), ts, fsp), ts
+
+
+def _edit(y: np.ndarray, sr: int, tracks: list[DopplerTrack], cfg: ScrubConfig, stats: dict,
+          line_map, first: int = 0) -> np.ndarray:
+    """Remove `tracks` from y in place (see _apply). line_map is _line_map of the signal the
+    harmonic-line check is made on; the tracks are numbered from `first` for their noise
+    seeds, so an edit can be resumed with later tracks and give the same result."""
+    x = y
+    lines = 0
+    cmap, ts = line_map
     nwin = max(1, int(round(30.0 / (ts[1] - ts[0]))))
-    for ti, tr in enumerate(tracks):
+    for ti, tr in enumerate(tracks, start=first):
         # a ridge track is extended past where it was seen; a matched-filter track's span
         # already covers +-2 min around its closest approach
         ext = cfg.extend_s if tr.pts_t is not None else 0.0
@@ -257,19 +313,22 @@ def _apply(x: np.ndarray, sr: int, tracks: list[DopplerTrack], cfg: ScrubConfig,
             # each line gets its own seeded stream, so results do not depend on thread timing
             return _remove_line(seg, sr, fs * ratios[k], cfg, np.random.default_rng([cfg.seed, ti, k]),
                                 lp, own=ratios[k] == 1.0)
+        # threads, not processes: the heavy steps are compiled or numpy and release the GIL,
+        # and a process pool's shared-memory round trip per track cost more than it saved
         with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
             for d in pool.map(one, keep):
                 y[a:b] += d
         lines += len(keep)
     stats["lines"] = stats.get("lines", 0) + lines
-    return y - x
+    return y
 
 
 def scan(x: np.ndarray, sr: int, cfg: ScrubConfig, log=None) -> list[DopplerTrack]:
     """Ridge tracks (tones visible frame by frame) plus matched-filter tracks (tones only
     visible integrated along a whole curve, as an attacker would look for them)."""
     t, f, L = stft.power_db(x, sr, cfg.n_detect, cfg.hop_detect, cfg.fmin, cfg.fmax)
-    tracks = find_tracks(L, t, f, thresh_db=cfg.thresh_db, max_rms=cfg.max_rms, min_dur_s=cfg.min_dur_s)
+    tracks = find_tracks(L, t, f, thresh_db=cfg.thresh_db, max_rms=cfg.max_rms, min_dur_s=cfg.min_dur_s,
+                         workers=cfg.workers if cfg.processes else 1)
     if cfg.mf_min_score is not None:
         mt, thr = matched_tracks(whiten(L), t, f, f_lo=max(cfg.fmin, 40.0), f_hi=min(cfg.fmax, 450.0),
                                  min_score=cfg.mf_min_score, max_score=cfg.mf_max_score,
@@ -336,32 +395,42 @@ def scrub_array(x: np.ndarray, sr: int = LOW_SR, cfg: ScrubConfig | None = None,
     if len(steady):
         x = x - np.stack([_steady_part(ch, sr, steady) for ch in x])
     mono = x.mean(axis=0)
+    # channels that are copies of each other (dual mono, up to codec noise) get one shared
+    # delta: half the work, and the edit stays mono instead of differing between the ears
+    same = len(x) > 1 and np.sqrt(np.mean((x - mono) ** 2)) <= DUAL_MONO * np.sqrt(np.mean(mono ** 2))
+    same = same or len(x) == 1
     tracks: list[DopplerTrack] = []
-    cur = mono
+    # the cleaned mix that feeds the next pass; edited in place, track by track, so for a
+    # single (or dual-mono) channel the final edit resumes it instead of redoing it
+    y = mono.astype(np.float64)
+    lmap = None
+    edited, edit_stats = 0, {}
     passes_run = 0
     for _ in range(cfg.passes):
         passes_run += 1
-        new = [tr for tr in scan(cur, sr, cfg, log) if not any(_same(tr, k) for k in tracks)]
+        new = [tr for tr in scan(y, sr, cfg, log) if not any(_same(tr, k) for k in tracks)]
         if not new:
             break
         tracks += new
         log(f"pass {passes_run}: {len(new)} new tracks ({sum(t.pts_t is None for t in new)} matched-filter)")
         if passes_run < cfg.passes:                     # the cleaned mix only feeds the next pass
-            cur = cur + _apply(cur, sr, new, cfg, {})   # earlier tracks are already gone from cur
+            lmap = lmap or _line_map(mono, sr, cfg)
+            _edit(y, sr, new, cfg, edit_stats, lmap, first=edited)
+            edited += len(new)
     stats: dict = {}
-    # channels that are copies of each other (dual mono, up to codec noise) get one shared
-    # delta: half the work, and the edit stays mono instead of differing between the ears
-    same = len(x) > 1 and np.sqrt(np.mean((x - mono) ** 2)) <= DUAL_MONO * np.sqrt(np.mean(mono ** 2))
-    chans = [mono] if same else list(x)
-    log(f"{len(tracks)} tracks; removing them from {len(chans)} channel(s)"
-        + (f" (the {len(x)} channels are the same signal)" if same else ""))
-    # channels in parallel, each with its own pool of line workers
-    ch_stats = [{} for _ in chans]
-    with ThreadPoolExecutor(max_workers=len(chans)) as pool:
-        delta = np.stack(list(pool.map(lambda k: _apply(chans[k], sr, tracks, cfg, ch_stats[k]), range(len(chans)))))
-    stats["lines"] = sum(st.get("lines", 0) for st in ch_stats)
+    log(f"{len(tracks)} tracks; removing them from {1 if same else len(x)} channel(s)"
+        + (f" (the {len(x)} channels are the same signal)" if same and len(x) > 1 else ""))
     if same:
-        delta = np.repeat(delta, len(x), axis=0)
+        if tracks[edited:]:
+            _edit(y, sr, tracks[edited:], cfg, edit_stats, lmap or _line_map(mono, sr, cfg), first=edited)
+        stats["lines"] = edit_stats.get("lines", 0)
+        delta = np.repeat((y - mono)[None, :], len(x), axis=0)
+    else:
+        # channels in parallel, each with its own pool of line workers
+        ch_stats = [{} for _ in x]
+        with ThreadPoolExecutor(max_workers=len(x)) as pool:
+            delta = np.stack(list(pool.map(lambda k: _apply(x[k], sr, tracks, cfg, ch_stats[k]), range(len(x)))))
+        stats["lines"] = sum(st.get("lines", 0) for st in ch_stats)
     sig = float(np.sqrt(np.mean(x ** 2)) + 1e-20)
     stats.update(passes=passes_run, tracks=len(tracks), steady_lines_hz=[round(float(v), 2) for v in steady],
                  delta_rms_db_re_signal=float(20 * np.log10(np.sqrt(np.mean(delta ** 2)) / sig + 1e-20)))

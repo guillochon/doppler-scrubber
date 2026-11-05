@@ -27,7 +27,7 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     if a.cmd == "scrub":
-        cfg = S.ScrubConfig(passes=a.passes, fmax=a.fmax, extend_s=a.extend, thresh_db=a.thresh)
+        cfg = S.ScrubConfig(passes=a.passes, fmax=a.fmax, extend_s=a.extend, thresh_db=a.thresh, processes=True)
         t0 = time.time()
         def log(m):
             print(f"[{time.time() - t0:6.0f} s] {m}", file=sys.stderr, flush=True)
@@ -36,7 +36,7 @@ def main(argv=None):
         print(f"{st['tracks']} Doppler tracks flattened in {st['passes']} passes; "
               f"change {st['delta_rms_db_re_signal']:.1f} dB re signal; wrote {a.output}")
     else:
-        cfg = S.ScrubConfig(fmax=a.fmax, thresh_db=a.thresh)
+        cfg = S.ScrubConfig(fmax=a.fmax, thresh_db=a.thresh, processes=True)
         sr, ch = S._probe(a.input)
         low = S._decode(a.input, S.LOW_SR, ch).mean(axis=0)
         tracks = S.scan(low, S.LOW_SR, cfg)

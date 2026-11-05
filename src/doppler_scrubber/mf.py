@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy.ndimage import maximum_filter1d
+from numba import njit
 from scipy.optimize import minimize
 
 from .tracks import C_SOUND, DopplerTrack, doppler_ratio
@@ -42,10 +43,6 @@ def _sampler(W, t, f):
         fi = np.where((fi >= 0) & (fi < F), fi, F).astype(np.int64)
         return flat.take(fi * (T + 1) + ti)
     return at
-
-
-def _contrast(at, tq, fq):
-    return at(tq, fq) - 0.5 * (at(tq, fq * (1 + CONTRAST)) + at(tq, fq * (1 - CONTRAST)))
 
 
 def _weights(R, tq):
@@ -77,24 +74,42 @@ def harmonic_map(C, f, harmonics):
     return out / harmonics
 
 
-def _window(at, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_curve, c, keep=8):
+@njit(cache=True, nogil=True)
+def _grid_scores(C, ti, R, w, f0s, f_first, df):
+    """score[i, j] = sum_n w[i, n] * C[bin of f0s[j] * R[i, n], ti[n]], a lookup off the grid
+    reading 0: the einsum over a (T0, N, F0) gather, without building it."""
+    nf_bins, nt = C.shape
+    out = np.zeros((R.shape[0], len(f0s)))
+    for i in range(R.shape[0]):
+        for n in range(R.shape[1]):
+            tn = ti[n]
+            if tn < 0 or tn >= nt:
+                continue
+            r, wn = R[i, n], w[i, n]
+            for j in range(len(f0s)):
+                fi = np.rint((f0s[j] * r - f_first) / df)
+                if fi >= 0 and fi < nf_bins:
+                    out[i, j] += wn * C[int(fi), tn]
+    return out
+
+
+def _window(C, t, f, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_curve, c, keep=8):
     """Top `keep` distinct grid curves in one window, as [(score, (f0, v, d, t_cpa))].
 
     Several are kept because on a coarse grid the maximum over thousands of noise curves
     can outscore a faint real curve; polishing then separates them (a real curve gains,
-    a noise curve loses). `at` samples the (widened) contrast map."""
+    a noise curve loses). C is the (widened) contrast map on the grid (t, f)."""
     tq = np.linspace(ta, tb, n_curve)
     t0s = np.arange(ta, tb, t0_step)
     f0s = np.arange(f_lo, f_hi, f0_step)
+    ti = np.rint((tq - t[0]) / (t[1] - t[0])).astype(np.int64)
     cand = []
     for v in v_grid:
         for d in d_grid:
             R = doppler_ratio(tq[None, :], v, d, t0s[:, None], c)          # (T0, N)
             w = _weights(R, tq)
             w /= w.sum(axis=1, keepdims=True)
-            Fq = f0s[None, None, :] * R[:, :, None]                       # (T0, N, F0)
-            Tq = np.broadcast_to(tq[None, :, None], Fq.shape)
-            s = np.einsum("tn,tnf->tf", w, at(Tq, Fq))
+            s = _grid_scores(C, ti, R, w, f0s, float(f[0]), float(f[1] - f[0]))
             for k in np.argsort(s, axis=None)[-keep:]:
                 i, j = np.unravel_index(int(k), s.shape)
                 cand.append((float(s[i, j]), (float(f0s[j]), float(v), float(d), float(t0s[i]))))
@@ -108,17 +123,53 @@ def _window(at, ta, tb, f_lo, f_hi, v_grid, d_grid, f0_step, t0_step, n_curve, c
     return out
 
 
-def _polish(at, p, ta, tb, c, harmonics=1):
+@njit(cache=True, nogil=True)
+def _curve_score(Wd, t_first, dt, f_first, df, tq, f0, v, d, tc, c, harmonics):
+    """What _polish maximises, compiled: the sweep-weighted mean ridge contrast (on-curve
+    brightness minus the mean at f*(1+-CONTRAST), nearest bin, 0 off the grid) along the
+    curve and its first `harmonics` harmonics."""
+    n = len(tq)
+    nf, nt = Wd.shape
+    R = np.empty(n)
+    k = c * c - v * v
+    for i in range(n):
+        tau = tq[i] - tc
+        u = (c * c * tau - np.sqrt(c * c * v * v * tau * tau + k * d * d)) / k
+        R[i] = c / (c + v * v * u / np.sqrt(d * d + v * v * u * u))
+    g = np.empty(n)                                  # |dR/dt| as np.gradient gives it
+    g[0] = abs((R[1] - R[0]) / (tq[1] - tq[0]))
+    g[n - 1] = abs((R[n - 1] - R[n - 2]) / (tq[n - 1] - tq[n - 2]))
+    for i in range(1, n - 1):
+        g[i] = abs((R[i + 1] - R[i - 1]) / (tq[i + 1] - tq[i - 1]))
+    gmax = max(g.max(), 1e-12)
+    num = 0.0
+    den = 0.0
+    for i in range(n):
+        w = g[i] / gmax + SWEEP_FLOOR
+        ti = np.rint((tq[i] - t_first) / dt)
+        con = 0.0
+        if ti >= 0 and ti < nt:
+            j = int(ti)
+            for h in range(1, harmonics + 1):
+                fq = h * f0 * R[i]
+                for m, fac in ((1.0, 1.0), (-0.5, 1.0 + CONTRAST), (-0.5, 1.0 - CONTRAST)):
+                    fi = np.rint((fq * fac - f_first) / df)
+                    if fi >= 0 and fi < nf:
+                        con += m * Wd[int(fi), j]
+        num += w * con / harmonics
+        den += w
+    return num / den
+
+
+def _polish(Wd, t, f, p, ta, tb, c, harmonics=1):
     tq = np.linspace(ta, tb, 400)
+    args = (float(t[0]), float(t[1] - t[0]), float(f[0]), float(f[1] - f[0]), tq)
 
     def neg(q):
         f0, v, d, tc = q
         if not (20 < v < 250 and 60 < d < 30000 and f0 > 0):
             return 1e3
-        R = doppler_ratio(tq, v, d, tc, c)
-        w = _weights(R, tq)
-        con = sum(_contrast(at, tq, h * f0 * R) for h in range(1, harmonics + 1)) / harmonics
-        return -float(np.sum(w * con) / np.sum(w))
+        return -_curve_score(Wd, *args, float(f0), float(v), float(d), float(tc), float(c), harmonics)
 
     f0, v, d, tc = p
     r = minimize(neg, p, method="Nelder-Mead",
@@ -156,16 +207,17 @@ def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120
         Cd = contrast_map(maximum_filter1d(Wd, 5, axis=0), f)
         if nh > 1:
             Cd = harmonic_map(Cd, f, nh)
-        at_c, at_w = _sampler(Cd, t, f), _sampler(Wd, t, f)
+        Cd = np.ascontiguousarray(Cd, np.float32)
+        W32 = np.ascontiguousarray(Wd, np.float32)
 
         def job(ta):
             tb = min(ta + window_s, t[-1])
-            return _window(at_c, ta, tb, f_lo, hi_f, v_grid, d_grid, 2.0, 3.0, 64, c)
+            return _window(Cd, t, f, ta, tb, f_lo, hi_f, v_grid, d_grid, 2.0, 3.0, 64, c)
 
         def polish(p):
             tc_heard = p[3] + p[2] / c
             lo, hi = max(tc_heard - 120, t[0]), min(tc_heard + 120, t[-1])
-            return _polish(at_w, p, lo, hi, c, nh) + (lo, hi)
+            return _polish(W32, t, f, p, lo, hi, c, nh) + (lo, hi)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             cands = [p for win in pool.map(job, starts) for sc, p in win if sc >= 0.6 * lo_score]
             return list(pool.map(polish, cands))

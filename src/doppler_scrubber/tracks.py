@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import scipy.ndimage as nd
 import scipy.signal as ss
+from numba import njit
 from scipy.optimize import least_squares
 
 C_SOUND = 340.0
@@ -88,11 +89,15 @@ def whiten(L: np.ndarray, smooth_frames: int = 3) -> np.ndarray:
 
 
 def _link(W, t, f, thresh_db, prominence_db, max_slope, max_gap_s):
+    """Narrowband peaks of each frame, linked frame to frame into chains [(t, f, amp)].
+
+    A chain takes the nearest peak within its tolerance of its own extrapolation; chains are
+    returned in the order they ended. The peaks are found per frame here, the linking (a
+    sequential pass over every frame) runs compiled in _link_core."""
     dt = t[1] - t[0]
     df = f[1] - f[0]
     max_gap = max(1, int(round(max_gap_s / dt)))
-    act_t, act_f, act_a, act_last = [], [], [], []
-    done = []
+    fps, amps, counts = [], [], np.zeros(W.shape[1], np.int64)
     for j in range(W.shape[1]):
         col = W[:, j]
         pk, _ = ss.find_peaks(col, height=thresh_db, prominence=prominence_db)
@@ -100,45 +105,117 @@ def _link(W, t, f, thresh_db, prominence_db, max_slope, max_gap_s):
             a, b, c = col[np.maximum(pk - 1, 0)], col[pk], col[np.minimum(pk + 1, len(col) - 1)]
             den = a - 2 * b + c
             off = np.where(np.abs(den) > 1e-9, 0.5 * (a - c) / np.where(den == 0, 1, den), 0.0)
-            fp = f[pk] + df * np.clip(off, -0.5, 0.5)
-            amp = b
-        else:
-            fp = amp = np.zeros(0)
-        used = np.zeros(len(fp), bool)
-        if act_t and len(fp):
-            pred = np.empty(len(act_t))
-            gap = np.empty(len(act_t))
-            for i in range(len(act_t)):
-                tt, ff = act_t[i], act_f[i]
-                k = min(len(tt), 8)
-                slope = (ff[-1] - ff[-k]) / (tt[-1] - tt[-k]) if k > 1 else 0.0
-                slope = float(np.clip(slope, -max_slope, max_slope))
-                pred[i] = ff[-1] + slope * (t[j] - tt[-1])
-                gap[i] = j - act_last[i]
-            # a young track has no reliable slope yet, so it gets the full sweep allowance;
-            # an established one must land near its own extrapolation
-            young = np.array([len(a) < 4 for a in act_t])
-            tol = 1.2 * df + np.where(young, max_slope * dt, 0.4) * gap
-            D = np.abs(fp[None, :] - pred[:, None])
-            ii, kk = np.nonzero(D < tol[:, None])
-            order = np.argsort(D[ii, kk])
-            taken = set()
-            for o in order:
-                i, k = ii[o], kk[o]
-                if i in taken or used[k]:
+            fps.append(f[pk] + df * np.clip(off, -0.5, 0.5))
+            amps.append(b)
+            counts[j] = len(pk)
+    if not fps:
+        return []
+    fp_all, amp_all = np.concatenate(fps), np.concatenate(amps)
+    starts = np.concatenate([[0], np.cumsum(counts)])
+    cap = int(counts.max()) * (max_gap + 2) + 16
+    pid, pj, order = _link_core(fp_all, starts, np.asarray(t, np.float64), float(df), float(dt),
+                                float(max_slope), max_gap, cap)
+    # points grouped by chain, in time order; chains in the order they ended
+    srt = np.argsort(pid, kind="stable")
+    bounds = np.searchsorted(pid[srt], np.arange(len(order) + 1))
+    out = []
+    for c in order:
+        ix = srt[bounds[c]:bounds[c + 1]]
+        out.append((np.asarray(t)[pj[ix]], fp_all[ix], amp_all[ix]))
+    return out
+
+
+@njit(cache=True)
+def _link_core(fp, starts, t, df, dt, max_slope, max_gap, cap):
+    """Chain id of every peak (fp[starts[j]:starts[j+1]] are frame j's), and the chain ids in
+    the order the chains ended. Each active chain keeps its last 8 points for its slope."""
+    npk = len(fp)
+    pid = np.full(npk, -1, np.int64)
+    pj = np.empty(npk, np.int64)
+    a_id = np.empty(cap, np.int64)
+    a_last = np.empty(cap, np.int64)
+    a_len = np.empty(cap, np.int64)
+    rt = np.empty((cap, 8))
+    rf = np.empty((cap, 8))
+    na = 0
+    nid = 0
+    order = np.empty(npk, np.int64)
+    no = 0
+    for j in range(len(starts) - 1):
+        s0, s1 = starts[j], starts[j + 1]
+        npj = s1 - s0
+        for k in range(npj):
+            pj[s0 + k] = j
+        used = np.zeros(npj, np.bool_)
+        if na > 0 and npj > 0:
+            pred = np.empty(na)
+            tol = np.empty(na)
+            for i in range(na):
+                L = a_len[i]
+                kk = min(L, 8)
+                lt, lf = rt[i, (L - 1) % 8], rf[i, (L - 1) % 8]
+                slope = 0.0
+                if kk > 1:
+                    slope = (lf - rf[i, (L - kk) % 8]) / (lt - rt[i, (L - kk) % 8])
+                    slope = min(max(slope, -max_slope), max_slope)
+                pred[i] = lf + slope * (t[j] - lt)
+                gap = j - a_last[i]
+                tol[i] = 1.2 * df + (max_slope * dt if L < 4 else 0.4) * gap
+            # candidate (chain, peak) pairs within tolerance, nearest first
+            ci = np.empty(na * npj, np.int64)
+            ck = np.empty(na * npj, np.int64)
+            cd = np.empty(na * npj)
+            m = 0
+            for i in range(na):
+                for k in range(npj):
+                    dd = abs(fp[s0 + k] - pred[i])
+                    if dd < tol[i]:
+                        ci[m] = i
+                        ck[m] = k
+                        cd[m] = dd
+                        m += 1
+            taken = np.zeros(na, np.bool_)
+            for o in np.argsort(cd[:m], kind="mergesort"):
+                i, k = ci[o], ck[o]
+                if taken[i] or used[k]:
                     continue
-                act_t[i].append(t[j]); act_f[i].append(fp[k]); act_a[i].append(amp[k]); act_last[i] = j
-                used[k] = True; taken.add(i)
-        for k in np.flatnonzero(~used):
-            act_t.append([t[j]]); act_f.append([fp[k]]); act_a.append([amp[k]]); act_last.append(j)
-        keep = [i for i in range(len(act_t)) if j - act_last[i] <= max_gap]
-        for i in range(len(act_t)):
-            if j - act_last[i] > max_gap:
-                done.append((act_t[i], act_f[i], act_a[i]))
-        act_t = [act_t[i] for i in keep]; act_f = [act_f[i] for i in keep]
-        act_a = [act_a[i] for i in keep]; act_last = [act_last[i] for i in keep]
-    done += list(zip(act_t, act_f, act_a))
-    return [(np.array(a), np.array(b), np.array(c)) for a, b, c in done]
+                L = a_len[i]
+                rt[i, L % 8] = t[j]
+                rf[i, L % 8] = fp[s0 + k]
+                a_len[i] = L + 1
+                a_last[i] = j
+                pid[s0 + k] = a_id[i]
+                used[k] = True
+                taken[i] = True
+        for k in range(npj):
+            if not used[k]:
+                a_id[na] = nid
+                a_last[na] = j
+                a_len[na] = 1
+                rt[na, 0] = t[j]
+                rf[na, 0] = fp[s0 + k]
+                pid[s0 + k] = nid
+                nid += 1
+                na += 1
+        # chains silent for more than max_gap frames end here (in creation order)
+        w = 0
+        for i in range(na):
+            if j - a_last[i] > max_gap:
+                order[no] = a_id[i]
+                no += 1
+            else:
+                if w != i:
+                    a_id[w] = a_id[i]
+                    a_last[w] = a_last[i]
+                    a_len[w] = a_len[i]
+                    rt[w] = rt[i]
+                    rf[w] = rf[i]
+                w += 1
+        na = w
+    for i in range(na):
+        order[no] = a_id[i]
+        no += 1
+    return pid, pj, order[:no]
 
 
 _GRID_V = np.array([25.0, 35.0, 50.0, 70.0, 100.0, 140.0, 200.0])
@@ -199,10 +276,14 @@ def fit_track(tt, ff, c=C_SOUND, reject_rms: float | None = None):
 def find_tracks(L: np.ndarray, t: np.ndarray, f: np.ndarray, *, thresh_db: float = 5.0,
                 prominence_db: float = 4.0, max_slope: float = 12.0, max_gap_s: float = 2.0,
                 min_dur_s: float = 12.0, max_rms: float = 0.3, min_sweep: float = 1.0,
-                max_jitter: float = 0.12) -> list[DopplerTrack]:
-    """Doppler-shaped tracks in a dB spectrogram L (F, T)."""
+                max_jitter: float = 0.12, workers: int = 1) -> list[DopplerTrack]:
+    """Doppler-shaped tracks in a dB spectrogram L (F, T).
+
+    The candidate chains are fitted and refined independently; with workers > 1 that runs
+    in a pool of processes (the fits are Python-bound, so threads would not help), with the
+    same result as in one."""
     W = whiten(L)
-    out = []
+    cands = []
     for tt, ff, aa in _link(W, t, f, thresh_db, prominence_db, max_slope, max_gap_s):
         if len(tt) < 8 or tt[-1] - tt[0] < min_dur_s:
             continue
@@ -215,21 +296,63 @@ def find_tracks(L: np.ndarray, t: np.ndarray, f: np.ndarray, *, thresh_db: float
         deg = 3 if np.ptp(tt) < 40 else 5
         if np.sqrt(np.mean((np.polyval(np.polyfit(s, ff, deg), s) - ff) ** 2)) > max_rms:
             continue
-        fit = fit_track(tt, ff, reject_rms=GRID_REJECT)
-        if fit is None:
-            continue
-        p, rms = fit
-        model = ideal_curve(tt, *p)
-        sweep = float(model[0] - model[-1]) if np.all(np.isfinite(model[[0, -1]])) else 0.0
-        if rms > max_rms or sweep < min_sweep:
-            continue
-        tr = DopplerTrack(float(tt[0]), float(tt[-1]), *map(float, p), rms, sweep, float(aa.mean()), tt, ff)
-        tr = refine(W, t, f, tr, max_rms=max_rms)
-        # pinned at a fit bound: not a flyover (birdsong and other tonal sources end up here)
-        if tr.v <= V_MIN * 1.05 or tr.v >= 245.0 or tr.d <= D_MIN * 1.05 or tr.d >= 29000.0:
-            continue
-        out.append(tr)
-    return _dedupe(out)
+        cands.append((tt, ff, aa))
+    opts = (max_rms, min_sweep)
+    out = _fit_in_pool(W, t, f, cands, opts, workers) if len(cands) > 2 * workers else None
+    if out is None:
+        out = [_fit_chain(W, t, f, c, opts) for c in cands]
+    return _dedupe([tr for tr in out if tr is not None])
+
+
+def _fit_chain(W, t, f, chain, opts) -> DopplerTrack | None:
+    """One linked chain -> a refined flyover track, or None if it is not one."""
+    tt, ff, aa = chain
+    max_rms, min_sweep = opts
+    fit = fit_track(tt, ff, reject_rms=GRID_REJECT)
+    if fit is None:
+        return None
+    p, rms = fit
+    model = ideal_curve(tt, *p)
+    sweep = float(model[0] - model[-1]) if np.all(np.isfinite(model[[0, -1]])) else 0.0
+    if rms > max_rms or sweep < min_sweep:
+        return None
+    tr = DopplerTrack(float(tt[0]), float(tt[-1]), *map(float, p), rms, sweep, float(aa.mean()), tt, ff)
+    tr = refine(W, t, f, tr, max_rms=max_rms)
+    # pinned at a fit bound: not a flyover (birdsong and other tonal sources end up here)
+    if tr.v <= V_MIN * 1.05 or tr.v >= 245.0 or tr.d <= D_MIN * 1.05 or tr.d >= 29000.0:
+        return None
+    return tr
+
+
+# ---------------------------------------------------------------- fits in the process pool
+
+def _fit_batch(name, shape, dtype, t, f, chains, opts):
+    from . import _pool
+    with _pool.attach(name, shape, dtype) as W:
+        return [_fit_chain(W, t, f, c, opts) for c in chains]
+
+
+def _fit_in_pool(W, t, f, cands, opts, workers):
+    """The fits of `cands`, in order, spread over the process pool (None: no pool here)."""
+    from concurrent.futures.process import BrokenProcessPool
+    from . import _pool
+    pool = _pool.get(workers)
+    if pool is None:
+        return None
+    sh = _pool.Shared(W.shape, W.dtype)
+    try:
+        sh.array[:] = W
+        # small batches handed out as workers free up: fit costs vary, and so do the cores
+        # (on hybrid CPUs some are much slower); results are put back in order
+        cuts = np.unique(np.r_[np.arange(0, len(cands), 4), len(cands)])
+        futs = [pool.submit(_fit_batch, sh.name, W.shape, sh.dtype, t, f, cands[a:b], opts)
+                for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
+        return [tr for fu in futs for tr in fu.result()]
+    except (BrokenProcessPool, RuntimeError, OSError):
+        _pool.broken()
+        return None
+    finally:
+        sh.close()
 
 
 def refine(W, t, f, tr: DopplerTrack, *, extend_s: float = 150.0, search_hz: float = 0.75,

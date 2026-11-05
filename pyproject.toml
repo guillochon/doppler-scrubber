@@ -1,6 +1,6 @@
 [project]
 name = "doppler-scrubber"
-version = "0.3.0"
+version = "0.4.0"
 description = "Remove aircraft Doppler tones from audio and video so recordings cannot be geolocated from them"
 readme = "README.md"
 authors = [
@@ -17,6 +17,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "numba>=0.60",
     "numpy>=2.0",
     "scipy>=1.13",
 ]

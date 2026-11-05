@@ -11,6 +11,8 @@ recording to within tens of metres
 ([dopplertrack](https://github.com/mjshiggins/dopplertrack) is an open
 implementation). This package finds those tones and removes them.
 
+![Spectrogram of a flyover on the SW Florida Eagle Cam: the falling Doppler tones are swiped away, leaving noise of the same level](docs/scrub.gif)
+
 ## Usage
 
 ```bash
@@ -22,6 +24,11 @@ uv run doppler-scrubber scrub recording.wav clean.flac --report report.json
 
 The report lists the removed tracks with their fitted speed, distance and
 time of closest approach, which is itself location-revealing: keep it private.
+
+From Python, `scrub_file(src, out, ScrubConfig(processes=True))` uses the same
+process pool as the CLI for the ridge fits; Windows and macOS start its workers
+by re-importing your script, so call it under `if __name__ == "__main__":`.
+Without `processes=True` everything runs in one process (threads only).
 
 ## How it works
 
@@ -89,14 +96,14 @@ attacker would have).
 | | Oyster Bay, NY (1 h) | SW Florida eagle cam (23 min clip) |
 |---|---|---|
 | dopplertrack `detect`, before | flyovers ranked 1 and 2 (15.7, 10.0) | flyovers ranked 1 and 3 (4.9, 3.7) |
-| dopplertrack `detect`, after | gone; best curve anywhere 1.9 | gone; best curve anywhere 1.6–1.9 |
+| dopplertrack `detect`, after | gone; best curve anywhere 1.8–2.2 | gone; best curve anywhere 1.6–1.9 |
 | known-point score of the true flight pair, before | 28.0 (the only pair) | 9.5, best wrong pair 6.7 |
-| known-point score of the true flight pair, after | 7.1 | 5.8–6.1, best wrong pair 4.8–5.1 (3 noise seeds) |
+| known-point score of the true flight pair, after (3 noise seeds) | 6.1–7.8 | 5.8–6.0, best wrong pair 4.8–5.1 |
 | blind 200 m search, before (dopplertrack README) | true pair 1st of 328, 43 m off after refining | true pair 1st of 607 |
 | blind 200 m search, after | not rerun for this version (0.1.0, where the true pair scored 7.9: 59th of 328, top guess 31 km away) | not run |
-| tracks removed / time | 456 / 34 min | 118 / 11 min |
+| tracks removed / time | 454 / 8.3 min | 117 / 4.6 min |
 | change above 2 kHz | −54 dB re signal | −81 dB re signal |
-| STFT cells changed by > 1 dB | 35 % | 9.6 % |
+| STFT cells changed by > 1 dB | 35 % | 9.3 % |
 
 The cost depends on how busy the recording is. Oyster Bay, under New York
 approach paths, is full of Doppler-shaped tones, and the scrubber replaces a
@@ -109,7 +116,7 @@ the true pair usually still scores a little above the best wrong one: the
 scrub removes what a blind search needs, but an attacker checking a
 suspected location keeps a weak confirmation. After scrubbing,
 DOPPLERGEIST's `discover` still finds 3 faint events in Oyster Bay (18 in
-the original) and 6 in the eagle cam clip (19 in the original). Every change is narrowband noise
+the original) and 9 in the eagle cam clip (19 in the original). Every change is narrowband noise
 traded for like noise, but listen to the result before relying on it.
 
 ## Examples
@@ -135,9 +142,10 @@ recording and the second is the nest's published position.
   leak into the other line's level estimate, and that narrow band can come
   out up to ~10 dB louder (over 30 s) than it was.
 - A suspected location can still be weakly confirmed (see Results).
-- Speed: roughly 35 minutes per hour of audio on a busy recording (Oyster
-  Bay, dual mono) and 11 minutes per 23 minutes on a quiet stereo one, on
-  16 threads.
+- Speed: about 8 minutes per hour of audio on a busy recording (Oyster Bay,
+  dual mono) and 5 minutes for 23 minutes of a quieter stereo one (eagle
+  cam), at below-normal priority on a 10-core Intel i5-12600K. The search
+  kernels are compiled with Numba (the first run compiles and caches them).
 
 ## Development
 
