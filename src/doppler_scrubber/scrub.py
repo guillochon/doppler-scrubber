@@ -39,7 +39,8 @@ DUAL_MONO = 10 ** (-50 / 20)   # channels closer than this (rms, re the mix) are
 @dataclass
 class ScrubConfig:
     fmin: float = 30.0             # band searched and cleaned, Hz
-    fmax: float = 1000.0
+    fmax: float = 1700.0           # the 4 kHz working copy is flat to here (decode + upsample lose
+                                   # 0.2 dB at 1.7 kHz, 1.7 dB at 1.8, 6 dB at 1.9: no clean removal above)
     n_detect: int = 8192           # detection STFT length at 4 kHz (2.05 s, 0.49 Hz bins)
     hop_detect: int = 1024
     passes: int = 2                # detect -> clean -> detect again on the cleaned audio

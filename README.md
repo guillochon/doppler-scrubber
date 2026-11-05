@@ -4,7 +4,7 @@ Remove aircraft Doppler tones from audio and video, so a recording cannot be
 geolocated from them, without otherwise changing how it sounds.
 
 Outdoor recordings carry faint tones from passing propeller aircraft (blade
-pass and its harmonics, roughly 40–1000 Hz). The way each tone falls in
+pass and its harmonics, roughly 40–1700 Hz). The way each tone falls in
 pitch as the aircraft passes depends on where the microphone was, and
 matching that curve against public ADS-B flight history can place a
 recording to within tens of metres
@@ -39,7 +39,7 @@ time of closest approach, which is itself location-revealing: keep it private.
      contrast integrated over a 4-minute window, and the best are polished
      with Nelder-Mead. This finds tones far too faint to show frame by frame,
      and anything scoring 2 dB or more is removed. The search is run again
-     on the mean contrast of harmonics 1–4: Doppler scales every harmonic by
+     on the mean contrast of harmonics 1–4 (fundamentals up to 250 Hz): Doppler scales every harmonic by
      the same factor, so a stack whose lines are each too faint alone can
      stand out as a whole, and summing them is what an attacker would do.
 2. **Remove.** Each line (the track times every ratio m/h, h ≤ 2, up to
@@ -89,19 +89,27 @@ attacker would have).
 | | Oyster Bay, NY (1 h) | SW Florida eagle cam (23 min clip) |
 |---|---|---|
 | dopplertrack `detect`, before | flyovers ranked 1 and 2 (15.7, 10.0) | flyovers ranked 1 and 3 (4.9, 3.7) |
-| dopplertrack `detect`, after | gone; best curve anywhere 1.9 | gone; best curve anywhere 2.2 |
+| dopplertrack `detect`, after | gone; best curve anywhere 1.9 | gone; best curve anywhere 1.6–1.9 |
 | known-point score of the true flight pair, before | 28.0 (the only pair) | 9.5, best wrong pair 6.7 |
-| known-point score of the true flight pair, after | 6.3 | 5.1, best wrong pair 5.8 (6.1 from the second camera point) |
+| known-point score of the true flight pair, after | 7.1 | 5.8–6.1, best wrong pair 4.8–5.1 (3 noise seeds) |
 | blind 200 m search, before (dopplertrack README) | true pair 1st of 328, 43 m off after refining | true pair 1st of 607 |
 | blind 200 m search, after | not rerun for this version (0.1.0, where the true pair scored 7.9: 59th of 328, top guess 31 km away) | not run |
-| tracks removed / time | 408 / 14.6 min | 98 / 4.7 min |
-| change above 2 kHz | −55 dB re signal | −89 dB re signal |
-| STFT cells changed by > 1 dB | 26 % | 6.3 % |
+| tracks removed / time | 456 / 34 min | 118 / 11 min |
+| change above 2 kHz | −54 dB re signal | −81 dB re signal |
+| STFT cells changed by > 1 dB | 35 % | 9.6 % |
 
 The cost depends on how busy the recording is. Oyster Bay, under New York
 approach paths, is full of Doppler-shaped tones, and the scrubber replaces a
-quarter of the 30–1000 Hz time-frequency cells there (with noise of the same
-level); a quieter recording loses far less. Every change is narrowband noise
+third of the 30–1700 Hz time-frequency cells there (with noise of the same
+level); a quieter recording loses far less.
+
+The noise put back into each band is random (seeded), and the known-point
+scores move by about ±0.5 between seeds. With the location already known,
+the true pair usually still scores a little above the best wrong one: the
+scrub removes what a blind search needs, but an attacker checking a
+suspected location keeps a weak confirmation. After scrubbing,
+DOPPLERGEIST's `discover` still finds 3 faint events in Oyster Bay (18 in
+the original) and 6 in the eagle cam clip (19 in the original). Every change is narrowband noise
 traded for like noise, but listen to the result before relying on it.
 
 ## Examples
@@ -126,8 +134,9 @@ recording and the second is the nest's published position.
 - Where lines of two tracks run within ~6 Hz of each other, a strong tone can
   leak into the other line's level estimate, and that narrow band can come
   out up to ~10 dB louder (over 30 s) than it was.
-- Speed: roughly 15 minutes per hour of audio on a busy recording (Oyster
-  Bay, dual mono) and 5 minutes per 20 minutes on a quiet stereo one, on
+- A suspected location can still be weakly confirmed (see Results).
+- Speed: roughly 35 minutes per hour of audio on a busy recording (Oyster
+  Bay, dual mono) and 11 minutes per 23 minutes on a quiet stereo one, on
   16 threads.
 
 ## Development

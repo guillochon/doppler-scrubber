@@ -17,12 +17,12 @@ def main(argv=None):
     s.add_argument("input"); s.add_argument("output")
     s.add_argument("--report", help="write tracks and stats as JSON (note: it describes the removed flyovers)")
     s.add_argument("--audio-only", action="store_true", help="drop video even if the output container allows it")
-    s.add_argument("--passes", type=int, default=2); s.add_argument("--fmax", type=float, default=1000.0)
+    s.add_argument("--passes", type=int, default=2); s.add_argument("--fmax", type=float, default=S.ScrubConfig.fmax)
     s.add_argument("--extend", type=float, default=90.0, help="seconds to clean beyond each visible track")
     s.add_argument("--thresh", type=float, default=6.0, help="peak threshold, dB above per-bin median")
 
     c = sub.add_parser("scan", help="list Doppler tracks without writing anything")
-    c.add_argument("input"); c.add_argument("--fmax", type=float, default=1000.0)
+    c.add_argument("input"); c.add_argument("--fmax", type=float, default=S.ScrubConfig.fmax)
     c.add_argument("--thresh", type=float, default=6.0)
 
     a = ap.parse_args(argv)

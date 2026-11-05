@@ -130,7 +130,7 @@ def _polish(at, p, ta, tb, c, harmonics=1):
 
 def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120.0,
                    min_score=2.0, max_score=4.0, null_quantile=0.9, min_sep_s=60.0, workers=4,
-                   searches=(1, 4), c=C_SOUND) -> tuple[list[DopplerTrack], dict]:
+                   searches=(1, 4), harm_f_max=1000.0, c=C_SOUND) -> tuple[list[DopplerTrack], dict]:
     """Doppler curves whose polished matched-filter score clears this recording's own null.
 
     W is a whitened spectrogram (F, T). Returns (tracks, threshold): the threshold is the
@@ -141,7 +141,7 @@ def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120
     ridge (pts_t is None): their curve is the fitted model.
 
     `searches` lists the harmonic counts searched: 1 is single lines, n > 1 the mean
-    contrast of harmonics 1..n, for fundamentals up to f[-1]/n, each with its own null;
+    contrast of harmonics 1..n, for fundamentals up to min(f[-1], harm_f_max)/n, each with its own null;
     its bounds are scaled by n**-0.4: averaging shrinks the noise spread by about 1/sqrt(n),
     but the best of many noise curves then sits relatively higher (in pure noise the
     4-harmonic search peaks at ~0.95 dB, the single-line one at ~2.1 dB).
@@ -173,7 +173,9 @@ def matched_tracks(W, t, f, *, f_lo=40.0, f_hi=450.0, window_s=240.0, step_s=120
     found, thrs = [], {}
     for nh in searches:
         scale = nh ** -0.4
-        hi_f = min(f_hi, f[-1] / nh)
+        # summed harmonics stay within harm_f_max: a wider fundamental range only adds noise
+        # curves, which lift the null and its threshold and so spare faint real passes
+        hi_f = min(f_hi, (f[-1] if nh == 1 else min(f[-1], harm_f_max)) / nh)
         if hi_f <= f_lo:
             continue
         polished = search(W, nh, min_score * scale, hi_f)
