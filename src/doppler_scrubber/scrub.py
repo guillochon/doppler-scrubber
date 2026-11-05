@@ -49,6 +49,8 @@ class ScrubConfig:
     extend_s: float = 90.0         # clean this far beyond where the tone was seen
     lp_s: float = 1.0              # amplitude low-pass length (bandwidth ~ 1/lp_s Hz)
     noise_offsets: tuple[float, ...] = (-6.0, -4.0, 4.0, 6.0)   # where the floor is measured, Hz
+    fill_s: float = 2.5            # time scale of the level put back (follows the side bands this closely)
+    fill_cap: float = 1.5          # ... kept within this factor of the short-term side-band level
     lp_model_s: float = 0.4        # low-pass for tracks known only from a model (~2.5 Hz band)
     line_ratio: float = 1.15       # a harmonic line is replaced only if its span-mean power exceeds this x floor
     line_db: float = 1.0           # ... and only if its 30 s ridge contrast reaches this somewhere (dB)
@@ -76,6 +78,11 @@ def _lowpass(z: np.ndarray, sr: int, length_s: float) -> np.ndarray:
     n = max(3, int(length_s * sr) | 1)
     w = np.hanning(n + 2)[1:-1]
     return ss.oaconvolve(z, w / w.sum(), mode="same")
+
+
+def _trimmed(side: np.ndarray) -> np.ndarray:
+    """Mean over the first axis without its lowest and highest rows (sorted input)."""
+    return side[1:-1].mean(axis=0) if len(side) > 2 else side.mean(axis=0)
 
 
 def _smooth(p: np.ndarray, sr: int, length_s: float) -> np.ndarray:
@@ -140,12 +147,15 @@ def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
         xm = xm0 if it == 0 else xm0 * _unit(-psi)
         psi_used, cf_used = psi, cf.copy()
         a = 2 * _lowpass(_decimate(xm, mr, dec2, BB_PASS), br, lp_s)
-        side = np.sort([_smooth(np.abs(2 * _lowpass(_decimate(xm * s, mr, dec2, BB_PASS),
-                                                    br, lp_s)) ** 2, br, 10.0)
-                        for s in side_e], axis=0)
+        side_p = [np.abs(2 * _lowpass(_decimate(xm * s, mr, dec2, BB_PASS), br, lp_s)) ** 2 for s in side_e]
         # trimmed mean of the side bands: robust to another tone in one of them, and unbiased
-        # for noise (a plain median of skewed power estimates reads low)
-        pn = side[1:-1].mean(axis=0) if len(side) > 2 else side.mean(axis=0)
+        # for noise (a plain median of skewed power estimates reads low). pn (10 s) decides
+        # where the tone is clear; pn_fill (fill_s) is the level put back, which must follow
+        # the neighbours closely in time: a 10 s level spreads a loud burst over +-5 s, and
+        # the band, filled and then scaled to it, shows the line's curve as a bright streak
+        pn = _trimmed(np.sort([_smooth(q, br, 10.0) for q in side_p], axis=0))
+        pn_s = _trimmed(np.sort([_smooth(q, br, cfg.fill_s) for q in side_p], axis=0))
+        pn_fill = np.clip(pn, pn_s / cfg.fill_cap, pn_s * cfg.fill_cap)
         pa = _smooth(np.abs(a) ** 2, br, lp_s)
         if it == 0 and not own and np.mean(np.abs(a) ** 2) < cfg.line_ratio * np.mean(pn):
             return np.zeros_like(x)                 # this harmonic carries nothing: leave it alone
@@ -165,7 +175,7 @@ def _remove_line(x: np.ndarray, sr: int, finst: np.ndarray, cfg: ScrubConfig,
         psi = 2 * np.pi * ((np.cumsum(cfm) - cfm) * dec1 + cfm) / sr
     # never put back more than the band held: where the side bands read louder than the band
     # itself (another sound in them), refilling at their level would add a tone-like band
-    pn = np.minimum(pn, _smooth(np.abs(a) ** 2, br, 10.0))
+    pn = np.minimum(pn_fill, _smooth(np.abs(a) ** 2, br, 10.0))
     # fade the replacement in and out over 5 s at the ends of the span, and over 2 s where
     # the line leaves fmin..fmax (a harmonic can sweep across fmax)
     n_r = max(1, min(int(5 * br), len(tb) // 2))

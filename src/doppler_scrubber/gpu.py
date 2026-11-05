@@ -120,6 +120,10 @@ def _smooth(p, sr, length_s):
     return uniform_filter1d(p, max(1, int(length_s * sr)), axis=-1, mode="nearest")
 
 
+def _trimmed(side):
+    return side[1:-1].mean(axis=0) if len(side) > 2 else side.mean(axis=0)
+
+
 def _upsample_linear(b, step, n):
     """np.interp of b (sampled every `step` points) at points 0..n-1, held after the last."""
     cp = _CP
@@ -178,14 +182,14 @@ def remove_lines(x: np.ndarray, fs: np.ndarray, ratios, owns, rngs, sr: int, cfg
     for it in range(3):
         xm = xm0 if it == 0 else xm0 * cp.exp(-1j * psi)
         a_ = 2 * _lowpass(_decimate(xm, h2, dec2), br, lp_s)
-        side = _smooth(cp.abs(2 * _lowpass(_decimate(xm[None] * side_e[:, None], h2, dec2), br, lp_s)) ** 2,
-                       br, 10.0)
-        side = cp.sort(side, axis=0)
-        pn = side[1:-1].mean(axis=0) if len(side) > 2 else side.mean(axis=0)
+        side_p = cp.abs(2 * _lowpass(_decimate(xm[None] * side_e[:, None], h2, dec2), br, lp_s)) ** 2
+        pn = _trimmed(cp.sort(_smooth(side_p, br, 10.0), axis=0))
+        pns = _trimmed(cp.sort(_smooth(side_p, br, cfg.fill_s), axis=0))
+        pnf = cp.clip(pn, pns / cfg.fill_cap, pns * cfg.fill_cap)
         pa = _smooth(cp.abs(a_) ** 2, br, lp_s)
         upd = running[:, None]
         A = cp.where(upd, a_, A)
-        PN = cp.where(upd, pn, PN)
+        PN = cp.where(upd, pnf, PN)
         PSI = cp.where(upd, psi, PSI)
         CF = cp.where(upd, cf, CF)
         if it == 0:
@@ -213,7 +217,7 @@ def remove_lines(x: np.ndarray, fs: np.ndarray, ratios, owns, rngs, sr: int, cfg
     A, PN, PSI, CF, r = A[keep], PN[keep], PSI[keep], CF[keep], r[keep]
     nk = len(keep_h)
 
-    PN = cp.minimum(PN, _smooth(cp.abs(A) ** 2, br, 10.0))
+    PN = cp.minimum(PN, _smooth(cp.abs(A) ** 2, br, 10.0))     # PN holds the fill level (fill_s)
     n_r = max(1, min(int(5 * br), nb // 2))
     g = np.ones(nb)
     g[:n_r] = g[-n_r:][::-1] = 0.5 - 0.5 * np.cos(np.pi * (np.arange(n_r) + 0.5) / n_r)

@@ -1,6 +1,6 @@
 [project]
 name = "doppler-scrubber"
-version = "0.5.0"
+version = "0.5.1"
 description = "Remove aircraft Doppler tones from audio and video so recordings cannot be geolocated from them"
 readme = "README.md"
 authors = [

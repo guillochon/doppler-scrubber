@@ -70,6 +70,10 @@ Without `processes=True` everything runs in one process (threads only).
    the phase drift. Over the track's span the band is *replaced*: the
    amplitude is subtracted in full and independent noise at the level of side
    bands 4–6 Hz away is put back, shaped so the band's spectrum stays flat.
+   That level is the side bands' 10 s average, held within a factor of 1.5 of
+   their 2.5 s level: near a loud burst (a bird call, a door) a 10 s average
+   would put the burst's level into the quiet seconds around it, and the band,
+   filled to that level, would show the line's curve as a bright streak.
    The band then holds noise of the right level and no tone at all, whatever
    its SNR. It is about 1 Hz wide for a measured ridge and about 2.5 Hz for a
    matched-filter model. Harmonic lines other than the detected one are
@@ -113,12 +117,12 @@ attacker would have).
 | dopplertrack `detect`, before | flyovers ranked 1 and 2 (15.7, 10.0) | flyovers ranked 1 and 3 (4.9, 3.7) |
 | dopplertrack `detect`, after | gone; best curve anywhere 1.8–2.2 | gone; best curve anywhere 1.6–1.9 |
 | known-point score of the true flight pair, before | 28.0 (the only pair) | 9.5, best wrong pair 6.7 |
-| known-point score of the true flight pair, after (3 noise seeds) | 6.1–7.8 | 5.8–6.0, best wrong pair 4.8–5.1 |
+| known-point score of the true flight pair, after (several runs and noise seeds) | 5.7–7.8 | 5.8–6.2, best wrong pair 4.8–5.5 |
 | blind 200 m search, before (dopplertrack README) | true pair 1st of 328, 43 m off after refining | true pair 1st of 607 |
 | blind 200 m search, after | not rerun for this version (0.1.0, where the true pair scored 7.9: 59th of 328, top guess 31 km away) | not run |
-| tracks removed / time (CPU; with GPU) | 454 / 8.3 min; 4.6 min | 117 / 4.6 min; 1.6 min |
+| tracks removed / time (CPU; with GPU) | 446 / 8.3 min; 4.3 min | 112 / 4.6 min; 1.5 min |
 | change above 2 kHz | −54 dB re signal | −81 dB re signal |
-| STFT cells changed by > 1 dB | 35 % | 9.3 % |
+| STFT cells changed by > 1 dB | 35 % | 8.9 % |
 
 The cost depends on how busy the recording is. Oyster Bay, under New York
 approach paths, is full of Doppler-shaped tones, and the scrubber replaces a
@@ -129,10 +133,21 @@ The noise put back into each band is random (seeded), and the known-point
 scores move by about ±0.5 between seeds. With the location already known,
 the true pair usually still scores a little above the best wrong one: the
 scrub removes what a blind search needs, but an attacker checking a
-suspected location keeps a weak confirmation. After scrubbing,
-DOPPLERGEIST's `discover` still finds 3 faint events in Oyster Bay (18 in
-the original) and 9 in the eagle cam clip (19 in the original). Every change is narrowband noise
-traded for like noise, but listen to the result before relying on it.
+suspected location keeps a weak confirmation.
+
+Against [DOPPLERGEIST](https://github.com/1337isnot1337/DOPPLERGEIST)'s
+`discover` (0.1.2, its improved default detector), the scrubbed Oyster Bay
+hour keeps 16 of the original's 161 events and the eagle cam clip 9 of 76.
+The two Oyster Bay flyovers it uses to locate the recording are gone. What
+stays is tones above 1.7 kHz, which are never edited (most of the Oyster Bay
+survivors), and faint fragments of a few passes.
+
+Removed bands come out at their neighbours' level on average (+0.1 to
++0.7 dB along the removed tracks, against +1 to +5 dB before), not darker:
+an inverted spectrogram gives dopplertrack no blind detection either. About
+one ridge track in ten (one in four on the eagle cam) still ends up 1 dB or
+more below its neighbours somewhere. Every change is narrowband noise traded
+for like noise, but listen to the result before relying on it.
 
 ## Examples
 
@@ -157,10 +172,13 @@ recording and the second is the nest's published position.
   leak into the other line's level estimate, and that narrow band can come
   out up to ~10 dB louder (over 30 s) than it was.
 - A suspected location can still be weakly confirmed (see Results).
+- Tones above `fmax` (1.7 kHz; the work is done on a 4 kHz copy) are left as
+  they are, and detectors that look higher, such as DOPPLERGEIST's (up to
+  8 kHz), still see them.
 - Speed: about 8 minutes per hour of audio on a busy recording (Oyster Bay,
   dual mono) and 5 minutes for 23 minutes of a quieter stereo one (eagle
   cam), at below-normal priority on a 10-core Intel i5-12600K; with an RTX
-  3080, 4.6 and 1.6 minutes. Ridge tracking and curve fitting, on the CPU,
+  3080, 4.3 and 1.5 minutes. Ridge tracking and curve fitting, on the CPU,
   are then most of the time. The search
   kernels are compiled with Numba (the first run compiles and caches them).
 
